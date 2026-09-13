@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Check-in · Ministranci</title>
+  <link rel="icon" type="image/png" href="/ikona.png">
+  <meta name="theme-color" content="#0a1628">
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    html{background:#0a1628;min-height:100%;min-height:100dvh}body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;min-height:100vh;background:linear-gradient(160deg,#0a1628 0%,#1a2744 50%,#0d1b2a 100%);color:#fff;padding:24px 16px;display:flex;align-items:center;justify-content:center}
+    .card{width:100%;max-width:400px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);border-radius:18px;padding:28px 22px;box-shadow:0 12px 40px rgba(0,0,0,.35)}
+    .icon{text-align:center;font-size:40px;margin-bottom:8px}
+    h1{text-align:center;font-size:22px;margin-bottom:6px;font-weight:800}
+    .sub{text-align:center;font-size:13px;color:rgba(255,255,255,.65);margin-bottom:20px;line-height:1.45}
+    label{display:block;font-size:13px;font-weight:600;color:rgba(255,255,255,.85);margin-bottom:4px}
+    input{width:100%;padding:12px 14px;border-radius:10px;border:1px solid rgba(255,255,255,.2);background:rgba(0,0,0,.25);color:#fff;font-size:16px;margin-bottom:12px;font-family:inherit}
+    input::placeholder{color:rgba(255,255,255,.35)}
+    button.primary{width:100%;padding:14px;border:none;border-radius:10px;background:#c9a227;color:#0a1628;font-weight:800;font-size:16px;cursor:pointer;margin-top:4px;font-family:inherit}
+    button.primary:disabled{opacity:.55;cursor:wait}
+    button.opt{width:100%;padding:12px 14px;border-radius:10px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.3);color:#fff;font-weight:600;font-size:14px;cursor:pointer;text-align:left;font-family:inherit}
+    #err{display:none;color:#ff8a9a;font-size:13px;font-weight:600;margin-bottom:10px;line-height:1.4}
+    #ok{display:none;color:#7dffa0;font-size:14px;font-weight:600;margin-bottom:10px;line-height:1.45}
+    #opcje-wrap{display:none;margin-bottom:12px}
+    #opcje-wrap p{font-size:13px;font-weight:700;margin-bottom:8px}
+    #opcje{display:flex;flex-direction:column;gap:8px}
+    .foot{text-align:center;font-size:11px;color:rgba(255,255,255,.35);margin-top:16px;line-height:1.4}
+    .geo-hint{font-size:12px;color:rgba(201,162,39,.9);text-align:center;margin-bottom:12px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">⛪</div>
+    <h1>Check-in na Mszę</h1>
+    <p class="sub">Wpisz ID i hasło tylko gdy jesteś przy kościele (GPS).</p>
+    <p class="geo-hint">📍 Wymagana lokalizacja w pobliżu kościoła</p>
+    <form onsubmit="event.preventDefault();wyslij()">
+      <label for="cid">ID</label>
+      <input type="text" id="cid" inputmode="numeric" placeholder="Np. 1234" autocomplete="username" required>
+      <label for="cpass">Hasło</label>
+      <input type="password" id="cpass" placeholder="Hasło" autocomplete="current-password" required>
+      <div id="err"></div>
+      <div id="ok"></div>
+      <div id="opcje-wrap"><p>Wybierz nabożeństwo:</p><div id="opcje"></div></div>
+      <button type="submit" class="primary" id="btn">Potwierdź obecność</button>
+    </form>
+    <p class="foot">GPS musi być włączony. Check-in spoza terenu kościoła zostanie odrzucony.</p>
+  </div>
+  <script>
+    // NOWY URL wdrożenia Apps Script
+    var GAS = "DANE_WRAŻLIWE";
+
+    function showErr(m,s){var e=document.getElementById("err");e.style.display="block";e.style.color=s?"#f5d76e":"#ff8a9a";e.textContent=m||"";document.getElementById("ok").style.display="none"}
+    function showOk(m){var o=document.getElementById("ok");o.style.display="block";o.textContent=m||"";document.getElementById("err").style.display="none";document.getElementById("opcje-wrap").style.display="none"}
+    function resetBtn(){var b=document.getElementById("btn");b.disabled=false;b.textContent="Potwierdź obecność"}
+
+    function wyslij(kod){
+      var id=String(document.getElementById("cid").value||"").trim();
+      var pass=String(document.getElementById("cpass").value||"").trim();
+      if(!kod)document.getElementById("opcje-wrap").style.display="none";
+      if(!id||!pass){showErr("Podaj ID i hasło.");return}
+      var btn=document.getElementById("btn");
+      btn.disabled=true;btn.textContent="Pobieranie GPS…";
+      if(!navigator.geolocation){resetBtn();showErr("Brak GPS. Użyj telefonu.");return}
+
+      navigator.geolocation.getCurrentPosition(function(pos){
+        btn.textContent="Zapisywanie…";
+        var q=new URLSearchParams({
+          action:"checkin",
+          id:id,
+          haslo:pass,
+          kod:kod||"AUTO",
+          lat:String(pos.coords.latitude),
+          lng:String(pos.coords.longitude),
+          accuracy:String(pos.coords.accuracy)
+        });
+        fetch(GAS+"?"+q.toString(),{method:"GET",redirect:"follow"})
+          .then(function(r){return r.text()})
+          .then(function(text){
+            resetBtn();
+            var res;
+            try{res=JSON.parse(text)}catch(e){
+              showErr("Serwer zwrócił nieprawidłową odpowiedź. Sprawdź URL wdrożenia GAS.");
+              console.error(text.slice(0,200));
+              return;
+            }
+            if(res.blad==="wybor_wymagany"&&res.opcje&&res.opcje.length){
+              showErr(res.wiadomosc||"Wybierz nabożeństwo.",true);
+              document.getElementById("opcje-wrap").style.display="block";
+              document.getElementById("opcje").innerHTML=res.opcje.map(function(o){
+                var k=String(o.kod||"").replace(/'/g,"\\'");
+                var n=String(o.nazwaLcd||o.nazwa||"Nabożeństwo").replace(/</g,"&lt;");
+                return '<button type="button" class="opt" onclick="wyslij(\''+k+'\')">'+n+' <span style="opacity:.75">(+'+(o.punkty!=null?o.punkty:"?")+' pkt)</span></button>';
+              }).join("");
+              return;
+            }
+            if(res.sukces){
+              showOk(res.wiadomosc||("Zapisano: "+(res.wydarzenie||"")+" (+"+(res.punkty||0)+" pkt)"));
+              document.getElementById("cpass").value="";
+            }else{
+              showErr(res.wiadomosc||"Nie udało się zapisać obecności.");
+            }
+          })
+          .catch(function(e){
+            resetBtn();
+            showErr("Błąd połączenia z serwerem.");
+            console.error(e);
+          });
+      },function(err){
+        resetBtn();
+        var m="Nie udało się pobrać lokalizacji. ";
+        if(err&&err.code===1)m+="Zezwól na lokalizację.";
+        else if(err&&err.code===2)m+="GPS niedostępny.";
+        else if(err&&err.code===3)m+="Timeout.";
+        else m+="Włącz lokalizację.";
+        showErr(m);
+      },{enableHighAccuracy:true,timeout:15000,maximumAge:30000});
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Panel Ministrantów</title>
+
+  <link rel="icon" type="image/png" href="/ikona.png">
+  <link rel="shortcut icon" type="image/png" href="/ikona.png">
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <link rel="apple-touch-icon" href="/ikona.png">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#0a1628">
+  <meta name="msapplication-TileImage" content="/ikona.png">
+  <meta name="msapplication-TileColor" content="#0a1628">
+  <meta name="apple-mobile-web-app-title" content="Ministranci">
+  <meta name="application-name" content="Ministranci">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
+  <script>
+    window.OneSignalDeferred = window.OneSignalDeferred || [];
+    OneSignalDeferred.push(async function(OneSignal) {
+      await OneSignal.init({
+        appId: "DANE_WRAŻLIWE",
+        serviceWorkerPath: "OneSignalSDKWorker.js",
+        serviceWorkerParam: { scope: "/" },
+        allowLocalhostAsSecureOrigin: true,
+        notifyButton: { enable: false },
+        promptOptions: {
+          slidedown: {
+            prompts: [{
+              type: "push",
+              autoPrompt: false,
+              text: {
+                actionMessage: "Włącz powiadomienia o dyżurach i oznaczeniach.",
+                acceptButton: "Włącz",
+                cancelButton: "Nie teraz"
+              }
+            }]
+          }
+        }
+      });
+      window.__oneSignalReady = true;
+    });
+  </script>
+  <script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    /*
+      Cross-platform shell:
+      - NIE używamy height:100dvh na iframe (na iOS standalone 100dvh < WKWebView → czarny pas).
+      - html/body wypełniają layout viewport: 100% + -webkit-fill-available.
+      - JS ustawia --shell-h = window.innerHeight (Safari, Chrome, PWA, desktop).
+      - visualViewport NIE steruje wysokością (klawiatura Android/iOS by obcinała appkę).
+    */
+    html {
+      width: 100%;
+      height: var(--shell-h, 100%);
+      min-height: 100%;
+      min-height: -webkit-fill-available;
+      overflow: hidden;
+      background: #0a1628;
+      background-color: #0a1628;
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
+    }
+    body {
+      width: 100%;
+      height: var(--shell-h, 100%);
+      min-height: 100%;
+      min-height: -webkit-fill-available;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      position: relative;
+      background: #0a1628;
+      background-color: #0a1628;
+    }
+    #gas-frame {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: var(--shell-h, 100%);
+      border: 0;
+      display: block;
+      background: #0a1628;
+      background-color: #0a1628;
+      z-index: 1;
+    }
+    #onesignal-bell-container { display: none !important; pointer-events: none !important; }
+    html[data-theme="dark"],
+    html[data-theme="dark"] body,
+    html[data-theme="dark"] #gas-frame {
+      background: #18191a !important;
+      background-color: #18191a !important;
+    }
+    html[data-theme="light"],
+    html[data-theme="light"] body,
+    html[data-theme="light"] #gas-frame {
+      background: #f0f2f5 !important;
+      background-color: #f0f2f5 !important;
+    }
+
+    /* Nakładka zgody — MUSI być na top-level (Netlify), nie w iframe */
+    #push-gate {
+      display: none;
+      position: fixed; inset: 0; z-index: 2147483646;
+      background: rgba(10, 22, 40, 0.72);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      align-items: center; justify-content: center;
+      padding: max(20px, env(safe-area-inset-top, 0px)) 20px max(20px, env(safe-area-inset-bottom, 0px));
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    #push-gate.open { display: flex; }
+    #push-gate-card {
+      background: #fff; color: #1c1e21;
+      border-radius: 16px; padding: 22px 20px;
+      max-width: 360px; width: 100%;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.35);
+      text-align: center;
+    }
+    #push-gate-card h3 { margin: 0 0 8px 0; font-size: 18px; }
+    #push-gate-card p { margin: 0 0 18px 0; font-size: 14px; line-height: 1.45; color: #65676b; }
+    #push-gate-btns { display: flex; gap: 10px; }
+    #push-gate-btns button {
+      flex: 1; border: none; border-radius: 10px;
+      padding: 12px 14px; font-size: 15px; font-weight: 700;
+      cursor: pointer; font-family: inherit;
+    }
+    #push-gate-yes { background: #1877f2; color: #fff; }
+    #push-gate-yes:active { background: #166fe5; }
+    #push-gate-no { background: #e4e6eb; color: #1c1e21; }
+    #push-gate-yes:disabled { opacity: 0.6; cursor: wait; }
+  </style>
+  <script>
+    const COOKIE_DAYS = 365;
+    function cookieSet(key, value) {
+      try {
+        var expires = new Date();
+        expires.setDate(expires.getDate() + COOKIE_DAYS);
+        document.cookie = encodeURIComponent("minist_" + key) + "=" + encodeURIComponent(value)
+          + "; expires=" + expires.toUTCString() + "; path=/; SameSite=Lax";
+      } catch(e) {}
+    }
+    function cookieGet(key) {
+      try {
+        var safeKey = encodeURIComponent("minist_" + key) + "=";
+        var cookies = document.cookie.split(";");
+        for (var i = 0; i < cookies.length; i++) {
+          var c = cookies[i].trim();
+          if (c.indexOf(safeKey) === 0) return decodeURIComponent(c.substring(safeKey.length));
+        }
+      } catch(e) {}
+      return null;
+    }
+    function cookieRemove(key) {
+      try {
+        document.cookie = encodeURIComponent("minist_" + key)
+          + "=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; SameSite=Lax";
+      } catch(e) {}
+    }
+    function storageSet(key, value) {
+      try { localStorage.setItem(key, value); } catch(e) {}
+      cookieSet(key, value);
+    }
+    function storageGet(key) {
+      var val = null;
+      try { val = localStorage.getItem(key); } catch(e) {}
+      if (!val) {
+        val = cookieGet(key);
+        if (val) { try { localStorage.setItem(key, val); } catch(e) {} }
+      }
+      return val;
+    }
+    function storageRemove(key) {
+      try { localStorage.removeItem(key); } catch(e) {}
+      cookieRemove(key);
+    }
+    function generateUUID() {
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        var r = Math.random() * 16 | 0;
+        return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+      });
+    }
+    var deviceId = storageGet("device_id");
+    if (!deviceId) {
+      deviceId = generateUUID();
+      storageSet("device_id", deviceId);
+    }
+    function setShellBackground(bg, themeName) {
+      try {
+        var c = bg || "#0a1628";
+        document.documentElement.style.background = c;
+        document.documentElement.style.backgroundColor = c;
+        if (document.body) {
+          document.body.style.background = c;
+          document.body.style.backgroundColor = c;
+        }
+        var fr = document.getElementById("gas-frame");
+        if (fr) {
+          fr.style.background = c;
+          fr.style.backgroundColor = c;
+        }
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute("content", c);
+        if (themeName === "dark" || themeName === "light") {
+          document.documentElement.setAttribute("data-theme", themeName);
+        } else if (themeName === "login") {
+          document.documentElement.removeAttribute("data-theme");
+        }
+      } catch (e) {}
+    }
+    window.setShellBackground = setShellBackground;
+
+    (function() {
+      // Start PWA = kolor logowania (bez białych pasów). Light/dark dopiero po zapisanym motywie.
+      var theme = storageGet("theme");
+      if (theme === "dark") setShellBackground("#18191a", "dark");
+      else if (theme === "light") setShellBackground("#f0f2f5", "light");
+      else setShellBackground("#0a1628", "login");
+    })();
+  </script>
+</head>
+<body>
+  <iframe id="gas-frame" title="Panel Ministrantów" allow="notifications *; geolocation *"></iframe>
+
+  <div id="push-gate" role="dialog" aria-modal="true" aria-labelledby="push-gate-title">
+    <div id="push-gate-card">
+      <h3 id="push-gate-title">🔔 Powiadomienia</h3>
+      <p>Aby dostawać alerty o dyżurach i oznaczeniach także przy zamkniętej aplikacji, zezwól na powiadomienia w przeglądarce.</p>
+      <div id="push-gate-btns">
+        <button type="button" id="push-gate-yes">Zezwól</button>
+        <button type="button" id="push-gate-no">Nie teraz</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function isAllowedOrigin(origin) {
+      if (!origin) return false;
+      if (origin === "null") return true;
+      if (origin === "https://script.google.com") return true;
+      if (origin.indexOf(".googleusercontent.com") !== -1) return true;
+      if (origin.indexOf("script.google.com") !== -1) return true;
+      if (origin.indexOf("googleapis.com") !== -1) return true;
+      if (origin.indexOf(".google.com") !== -1) return true;
+      return false;
+    }
+    function storageGetAll() {
+      var result = {};
+      try {
+        for (var i = 0; i < localStorage.length; i++) {
+          var k = localStorage.key(i);
+          result[k] = localStorage.getItem(k);
+        }
+      } catch(e) {}
+      // Wszystkie minist_* z cookie (snooze, theme, device_id) — iOS czasem czyści localStorage PWA
+      try {
+        var cookies = document.cookie.split(";");
+        for (var c = 0; c < cookies.length; c++) {
+          var part = cookies[c].trim();
+          var eq = part.indexOf("=");
+          if (eq < 0) continue;
+          var ck = decodeURIComponent(part.substring(0, eq));
+          var cv = decodeURIComponent(part.substring(eq + 1));
+          if (ck.indexOf("minist_") === 0) {
+            var rawKey = ck.substring(7);
+            if (rawKey && (result[rawKey] === undefined || result[rawKey] === null)) {
+              result[rawKey] = cv;
+              try { localStorage.setItem(rawKey, cv); } catch (eLs) {}
+            }
+          }
+        }
+      } catch (eC) {}
+      ["device_id", "theme"].forEach(function(key) {
+        if (!result[key]) {
+          var val = cookieGet(key);
+          if (val) {
+            result[key] = val;
+            try { localStorage.setItem(key, val); } catch(e) {}
+          }
+        }
+      });
+      if (!result["device_id"]) result["device_id"] = deviceId;
+      return result;
+    }
+
+    function broadcastToGas(payload) {
+      function walk(win, depth) {
+        if (!win || depth > 8) return;
+        try { win.postMessage(payload, "*"); } catch (eW) {}
+        try {
+          var fs = win.frames;
+          if (fs && fs.length) {
+            for (var i = 0; i < fs.length; i++) walk(fs[i], depth + 1);
+          }
+        } catch (eF) {}
+      }
+      try { walk(frame && frame.contentWindow, 0); } catch (e1) {}
+    }
+
+    var frame = document.getElementById("gas-frame");
+    var baseSrc = "DANE_WRAŻLIWE";
+    frame.src = baseSrc + "?deviceId=" + encodeURIComponent(deviceId);
+
+    function readSafeAreaInsets() {
+      var probe = document.createElement("div");
+      probe.setAttribute("aria-hidden", "true");
+      probe.style.cssText = "position:fixed;top:0;left:0;width:0;height:0;padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px);visibility:hidden;pointer-events:none;";
+      document.body.appendChild(probe);
+      var cs = window.getComputedStyle(probe);
+      var insets = {
+        top: parseFloat(cs.paddingTop) || 0,
+        right: parseFloat(cs.paddingRight) || 0,
+        bottom: parseFloat(cs.paddingBottom) || 0,
+        left: parseFloat(cs.paddingLeft) || 0
+      };
+      document.body.removeChild(probe);
+      return insets;
+    }
+
+    function isStandaloneApp() {
+      try {
+        if (window.navigator && window.navigator.standalone === true) return true;
+        if (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) return true;
+        if (window.matchMedia && window.matchMedia("(display-mode: fullscreen)").matches) return true;
+      } catch (eSt) {}
+      return false;
+    }
+
+    function getLayoutHeight() {
+      var inner = window.innerHeight || 0;
+      var client = document.documentElement.clientHeight || 0;
+      var h = Math.max(inner, client);
+      var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent || "") ||
+        (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+      // iOS standalone: innerHeight bywa krótsze niż pełny fizyczny ekran
+      // (brakuje obszaru status bar / Home Indicator), co bez kompensacji
+      // zostawia czarną dziurę na dole/górze. Wcześniejsze próby kompensacji
+      // (screen.availHeight, safe-area insets z sondy) przesadzały i spychały
+      // dolny fixed .nav poza widoczny ekran. window.screen.height to stały,
+      // prosty, pełny fizyczny rozmiar ekranu w CSS px (bez wyliczeń/sond) —
+      // używamy go jako górnego ograniczenia, tylko gdy jest sensownie bliski
+      // aktualnemu innerHeight (różnica < 200px), żeby nie "złapać" złej
+      // orientacji / dziwnego stanu i nie zawyżyć za bardzo.
+      if (isIOS && isStandaloneApp() && window.screen && window.screen.height) {
+        var full = window.screen.height;
+        if (full > h && (full - h) < 200) h = full;
+      }
+      return h;
+    }
+
+    function fitShellToViewport() {
+      var h = getLayoutHeight();
+      if (!h) return;
+      var px = h + "px";
+      document.documentElement.style.setProperty("--shell-h", px);
+      document.documentElement.style.height = px;
+      document.body.style.height = px;
+      frame.style.top = "0px";
+      frame.style.left = "0px";
+      frame.style.right = "0px";
+      frame.style.bottom = "0px";
+      frame.style.width = "100%";
+      frame.style.height = px;
+    }
+
+    function sendSafeAreaToGas() {
+      var ins = readSafeAreaInsets();
+      var h = getLayoutHeight();
+      try {
+        broadcastToGas({
+          type: "SAFE_AREA",
+          top: ins.top,
+          right: ins.right,
+          bottom: ins.bottom,
+          left: ins.left,
+          height: h,
+          standalone: isStandaloneApp()
+        });
+      } catch (eSa) {}
+    }
+
+    function applyShellLayout() {
+      fitShellToViewport();
+      sendSafeAreaToGas();
+    }
+
+    applyShellLayout();
+    window.addEventListener("resize", applyShellLayout);
+    // Dodatkowy trigger (nie źródło wysokości!): niektóre przeglądarki mobilne
+    // (głównie Chrome/Android przy chowaniu paska adresu) nie odpalają "resize"
+    // od razu. getLayoutHeight() nadal liczy z innerHeight/screen, nie z
+    // visualViewport — więc klawiatura ekranowa nie ścina layoutu.
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", applyShellLayout);
+    }
+    window.addEventListener("orientationchange", function() {
+      setTimeout(applyShellLayout, 80);
+      setTimeout(applyShellLayout, 320);
+    });
+    window.addEventListener("pageshow", applyShellLayout);
+    document.addEventListener("visibilitychange", function() {
+      if (!document.hidden) applyShellLayout();
+    });
+    frame.addEventListener("load", function() {
+      applyShellLayout();
+      setTimeout(applyShellLayout, 300);
+      setTimeout(applyShellLayout, 1000);
+    });
+
+    // Stan prośby o push (żeby odpowiedzieć do właściwego iframe)
+    var _pushReq = { source: null, origin: null, userId: "" };
+
+    function closePushGate() {
+      var g = document.getElementById("push-gate");
+      if (g) g.classList.remove("open");
+      var y = document.getElementById("push-gate-yes");
+      if (y) { y.disabled = false; y.textContent = "Zezwól"; }
+    }
+
+    function replyPushResult(granted, errorMsg) {
+      var payload = {
+        type: "ONESIGNAL_PERMISSION_RESULT",
+        granted: !!granted,
+        error: errorMsg || ""
+      };
+      console.log("[push-gate] reply", payload);
+
+      function tryPost(win, label) {
+        if (!win) return;
+        try {
+          win.postMessage(payload, "*");
+        } catch (e) {
+          console.warn("[push-gate] post fail", label, e);
+        }
+      }
+
+      tryPost(_pushReq.source, "source");
+      try { broadcastToGas(payload); } catch (eB) {}
+      tryPost(frame && frame.contentWindow, "frame");
+
+      _pushReq = { source: null, origin: null, userId: "" };
+      closePushGate();
+    }
+
+    function openPushGate(userId, source, origin) {
+      console.log("[push-gate] open", userId, origin);
+      _pushReq = { source: source, origin: origin, userId: String(userId || "") };
+      var g = document.getElementById("push-gate");
+      if (g) g.classList.add("open");
+      var ack = { type: "ONESIGNAL_GATE_OPENED" };
+      try { if (source) source.postMessage(ack, "*"); } catch (eS) {}
+      try { broadcastToGas(ack); } catch (eA) {}
+    }
+
+    // Klik „Zezwól” na TOP-LEVEL = prawdziwy gest użytkownika → przeglądarka pokaże prompt
+    document.getElementById("push-gate-yes").addEventListener("click", async function() {
+      var btn = document.getElementById("push-gate-yes");
+      btn.disabled = true;
+      btn.textContent = "Czekaj…";
+
+      var savedUserId = _pushReq.userId || "";
+      var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent || "") ||
+        (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+      var isStandalone = (window.navigator.standalone === true) ||
+        (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
+
+      // Już denied
+      if (typeof Notification !== "undefined" && Notification.permission === "denied") {
+        replyPushResult(false, "denied");
+        alert("Powiadomienia są zablokowane dla tej strony.\n\nOdblokuj je w ustawieniach iPhone (Ustawienia → Powiadomienia / Safari).");
+        return;
+      }
+
+      // iOS poza PWA: systemowe okienko zwykle się nie pojawia
+      if (isIOS && !isStandalone && typeof Notification !== "undefined" && Notification.permission === "default") {
+        replyPushResult(false, "ios-need-pwa");
+        alert("Na iPhone powiadomienia działają po dodaniu strony do ekranu głównego:\n\nUdostępnij → Do ekranu początkowego → otwórz ikonę → Włącz powiadomienia.");
+        return;
+      }
+
+      var granted = false;
+      try {
+        // NATYWNY prompt OD RAZU (w geście kliknięcia — krytyczne)
+        if (typeof Notification !== "undefined") {
+          if (Notification.permission === "default") {
+            await Notification.requestPermission();
+          }
+          granted = (Notification.permission === "granted");
+        }
+      } catch (eN) {
+        console.warn("Notification.requestPermission", eN);
+      }
+
+      // Odpowiedź do iframe NATYCHMIAST (nie czekaj na OneSignal)
+      replyPushResult(granted, granted ? "" : ((typeof Notification !== "undefined" && Notification.permission) || "unknown"));
+
+      // OneSignal w tle (subskrypcja / external id)
+      window.OneSignalDeferred = window.OneSignalDeferred || [];
+      OneSignalDeferred.push(async function(OneSignal) {
+        try {
+          if (savedUserId) {
+            try { await OneSignal.login(String(savedUserId)); } catch (eL) {}
+          }
+          if (granted) {
+            try {
+              if (OneSignal.Notifications && typeof OneSignal.Notifications.requestPermission === "function") {
+                await OneSignal.Notifications.requestPermission();
+              }
+            } catch (eOs) {}
+            try {
+              if (OneSignal.User && OneSignal.User.PushSubscription &&
+                  typeof OneSignal.User.PushSubscription.optIn === "function") {
+                await OneSignal.User.PushSubscription.optIn();
+              }
+            } catch (eOpt) {}
+          }
+        } catch (err) {
+          console.warn("OneSignal background", err);
+        }
+      });
+    });
+
+    document.getElementById("push-gate-no").addEventListener("click", function() {
+      replyPushResult(false, "dismissed");
+    });
+
+    window.addEventListener("message", function(e) {
+      var msg = e.data;
+      if (!msg || !msg.type) return;
+      // iframe GAS bywa zagnieżdżony: e.source !== frame.contentWindow
+      var fromOurFrame = false;
+      try {
+        fromOurFrame = (e.source === frame.contentWindow);
+        if (!fromOurFrame && frame.contentWindow) {
+          var w = e.source;
+          for (var depth = 0; depth < 8 && w; depth++) {
+            try {
+              if (w === frame.contentWindow) { fromOurFrame = true; break; }
+              if (w === w.parent) break;
+              w = w.parent;
+            } catch (errWalk) {
+              // cross-origin — uznaj za nasze, jeśli origin Google
+              if (isAllowedOrigin(e.origin)) fromOurFrame = true;
+              break;
+            }
+          }
+        }
+      } catch (errSrc) {}
+      var osMsg = (String(msg.type).indexOf("ONESIGNAL_") === 0);
+      var lsMsg = (String(msg.type).indexOf("LS_") === 0);
+      var saMsg = (msg.type === "SAFE_AREA_REQUEST" || msg.type === "SHELL_BG");
+      // Googleusercontent / script.google / null origin z iframe GAS
+      if (!fromOurFrame && !isAllowedOrigin(e.origin) && e.origin !== "null" && !osMsg && !lsMsg && !saMsg) return;
+      if (!fromOurFrame && !isAllowedOrigin(e.origin) && e.origin && e.origin !== "null" &&
+          e.origin.indexOf("http") === 0 && !osMsg && !lsMsg && !saMsg) {
+        if (e.origin.indexOf("google") < 0 && e.origin.indexOf("netlify") < 0) return;
+      }
+      // OneSignal + LS z Google: zawsze przyjmuj (nested iframe potrafi zepsuć fromOurFrame)
+      if ((osMsg || lsMsg || saMsg) && isAllowedOrigin(e.origin)) fromOurFrame = true;
+      if ((osMsg || saMsg) && (e.origin === "null" || !e.origin)) fromOurFrame = true;
+
+      if (msg.type === "LS_SET") {
+        storageSet(msg.key, msg.value);
+        if (msg.key === "theme") {
+          if (msg.value === "dark") setShellBackground("#18191a", "dark");
+          else setShellBackground("#f0f2f5", "light");
+        }
+      } else if (msg.type === "SHELL_BG") {
+        setShellBackground(msg.background || "#0a1628", msg.theme || "login");
+      } else if (msg.type === "LS_GET") {
+        var val = storageGet(msg.key);
+        if (msg.key === "device_id" && !val) val = deviceId;
+        var lsRes = { type: "LS_RESULT", key: msg.key, value: val, reqId: msg.reqId };
+        try { e.source.postMessage(lsRes, "*"); } catch (eR) {}
+        try { broadcastToGas(lsRes); } catch (eB2) {}
+      } else if (msg.type === "LS_REMOVE") {
+        storageRemove(msg.key);
+      } else if (msg.type === "LS_GET_ALL") {
+        var allPayload = { type: "LS_ALL", data: storageGetAll() };
+        try { e.source.postMessage(allPayload, "*"); } catch (eAll) {}
+        try { broadcastToGas(allPayload); } catch (eAll2) {}
+      } else if (msg.type === "SAFE_AREA_REQUEST") {
+        sendSafeAreaToGas();
+      } else if (msg.type === "ONESIGNAL_LOGIN") {
+        if (msg.userId) {
+          window.OneSignalDeferred = window.OneSignalDeferred || [];
+          OneSignalDeferred.push(async function(OneSignal) {
+            try {
+              await OneSignal.login(String(msg.userId));
+              console.log("[OneSignal] login", msg.userId);
+            } catch (err) {
+              console.error("OneSignal login error:", err);
+            }
+          });
+        }
+      } else if (msg.type === "ONESIGNAL_LOGOUT") {
+        window.OneSignalDeferred = window.OneSignalDeferred || [];
+        OneSignalDeferred.push(async function(OneSignal) {
+          try {
+            await OneSignal.logout();
+            console.log("[OneSignal] logout");
+          } catch (err) {
+            console.error("OneSignal logout error:", err);
+          }
+        });
+      } else if (msg.type === "ONESIGNAL_REQUEST_PERMISSION") {
+        // NIE wołamy requestPermission tutaj (brak gestu) —
+        // pokazujemy nakładkę; prawdziwy prompt po kliknięciu „Zezwól”
+        openPushGate(msg.userId || "", e.source, e.origin);
+      }
+    });
+  </script>
+</body>
+</html>
