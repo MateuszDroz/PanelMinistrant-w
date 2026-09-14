@@ -85,13 +85,24 @@ Wrażliwe dane ustaw w **Script Properties** w GAS (`Projekt → Ustawienia proj
 3. Ustaw Script Properties (patrz wyżej i `.env.example`).
 4. `Wdróż → Nowe wdrożenie → Aplikacja internetowa` → dostęp: `Wszyscy`.
 5. Skopiuj URL wdrożenia do zmiennych środowiskowych Netlify.
-6. Zapoznaj się z [`SECURITY.md`](SECURITY.md) przed uruchomieniem produkcyjnym — projekt przechowuje dane osobowe (w tym dzieci), więc wymaga podstawowego utwardzenia zabezpieczeń.
+6. Zapoznaj się z [`SECURITY.md`](SECURITY.md) — projekt przechowuje dane osobowe (w tym dzieci), więc odpowiadasz za zgodność wdrożenia z lokalnymi przepisami o ochronie danych.
+
+---
+
+## Prywatność
+
+Aplikacja zbiera wyłącznie dane niezbędne do jej działania:
+
+- **Dane logowania** (login/hasło) — do uwierzytelnienia użytkownika w panelu.
+- **Dane diagnostyczne przy zgłoszeniu problemu** — wyłącznie po zaznaczeniu zgody w formularzu zgłoszenia błędu: rozdzielczość ekranu, system, przeglądarka, adres URL. Wykorzystywane tylko w celu rozwiązania zgłoszonego problemu.
+
+Żadne inne dane (np. analityczne, śledzące) nie są zbierane poza tym, co jest funkcjonalnie potrzebne do prowadzenia ewidencji ministrantów (obecności, punkty, dyżury).
 
 ---
 
 ## Bezpieczeństwo
 
-Ten projekt przechowuje dane osobowe, w tym dane małoletnich. Przed wdrożeniem produkcyjnym zapoznaj się z [`SECURITY.md`](SECURITY.md). Jeśli znajdziesz podatność, zgłoś ją zgodnie z instrukcją w tym pliku — **nie publikuj jej w publicznym issue**.
+Ten projekt przechowuje dane osobowe, w tym dane małoletnich. Zapoznaj się z [`SECURITY.md`](SECURITY.md). Jeśli znajdziesz podatność, zgłoś ją zgodnie z instrukcją w tym pliku — **nie publikuj jej w publicznym issue**.
 
 ---
 
