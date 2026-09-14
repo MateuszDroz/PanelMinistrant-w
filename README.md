@@ -1,5 +1,6 @@
 # PanelMinistrant-w
 PanelMinistrantów by Mateusz Droż
+
 <div align="center">
 
 # Panel Ministrantów
@@ -11,7 +12,7 @@ PanelMinistrantów by Mateusz Droż
 
 Aplikacja webowa do zarządzania ministrantami — obecności, punkty, dyżury, RFID i powiadomienia push.
 
-*Parafia Najświętszej Maryi Panny Nieustającej Pomocy*
+Projekt open source, pierwotnie stworzony dla jednej parafii — możesz postawić własną, niezależną instancję.
 
 </div>
 
@@ -19,7 +20,7 @@ Aplikacja webowa do zarządzania ministrantami — obecności, punkty, dyżury, 
 
 ## Funkcje
 
-- **Logowanie** z hashowanymi hasłami (MD5 + sól)
+- **Logowanie** z hashowanymi hasłami
 - **System punktowy** — msze, zbiórki, wyjazdy, inne zdarzenia
 - **Czytnik RFID (ESP32)** — przyłożenie karty rejestruje obecność automatycznie
 - **Check-in przez QR kod**
@@ -45,38 +46,18 @@ Aplikacja webowa do zarządzania ministrantami — obecności, punkty, dyżury, 
 
 ---
 
-## Architektura
+## Architektura (skrót)
 
 ```
 Netlify (shell)
-    └── iframe
-            └── Google Apps Script /exec
-                    ├── doGet()          → panel HTML
-                    ├── ?action=rfid     → odbicia RFID
-                    ├── ?action=checkin  → check-in QR
-                    ├── ?action=config   → konfiguracja ESP32
-                    └── ?action=err      → diagnostyka ESP32
+    └── Google Apps Script /exec
+            ├── panel webowy (logowanie, punkty, dyżury)
+            ├── endpoint dla czytnika RFID
+            ├── endpoint check-in QR
+            └── endpointy konfiguracji / diagnostyki ESP32
 ```
 
-Komunikacja Netlify ↔ GAS przez `postMessage` (most localStorage) — GAS działa w podwójnie zagnieżdżonym cross-origin iframe.
-
----
-
-## API czytnika RFID
-
-**Pobierz zdarzenia przy starcie:**
-```
-GET ?action=config
-→ { "sukces": true, "wydarzenia": [{ "kod": "AUTO", "nazwa": "Auto (msza/dyżur)", "punkty": 0 }] }
-```
-
-**Przyłożenie karty:**
-```
-GET ?action=rfid&uid=XXXX&type=AUTO&device=nazwa_czytnika
-→ { "sukces": true, "imie": "Jan", "wydarzenie": "Msza", "punkty": 5, "suma": 120 }
-```
-
-Tryb `AUTO` wykrywa automatycznie czy trwa msza czy dyżur na podstawie kalendarza.
+Pełna specyfikacja endpointów, formatu zapytań i odpowiedzi znajduje się w [`docs/API.md`](docs/API.md) — czytaj ją, jeśli integrujesz własny czytnik lub rozwijasz backend. Nie publikujemy tu szczegółów działającej instancji parafialnej.
 
 ---
 
@@ -93,41 +74,27 @@ Tryb `AUTO` wykrywa automatycznie czy trwa msza czy dyżur na podstawie kalendar
 
 ## Konfiguracja
 
-Wrażliwe dane ustaw w **Script Properties** w GAS (`Projekt → Ustawienia projektu → Właściwości skryptu`), nigdy nie wpisuj ich bezpośrednio w kodzie:
-
-| Klucz | Opis |
-|---|---|
-| `onesignal_app_id` | App ID z panelu OneSignal |
-| `onesignal_rest_key` | REST API Key z panelu OneSignal |
-| `checkin_lat` | Szerokość geograficzna (check-in) |
-| `checkin_lng` | Długość geograficzna (check-in) |
-| `checkin_promien` | Promień check-inu w metrach |
+Wrażliwe dane ustaw w **Script Properties** w GAS (`Projekt → Ustawienia projektu → Właściwości skryptu`), nigdy nie wpisuj ich bezpośrednio w kodzie ani nie commituj do repozytorium. Przykładowa lista wymaganych kluczy znajduje się w [`.env.example`](.env.example).
 
 ---
 
-## Wdrożenie
+## Wdrożenie własnej instancji
 
-1. Utwórz nowy projekt w [Google Apps Script](https://script.google.com)
-2. Wgraj pliki `Kod.gs` i `Index.html`
-3. Ustaw Script Properties (patrz wyżej)
-4. `Wdróż → Nowe wdrożenie → Aplikacja internetowa` → dostęp: `Wszyscy`
-5. Skopiuj URL wdrożenia do zmiennych środowiskowych Netlify
+1. Sforkuj repozytorium i utwórz własny arkusz Google Sheets (nie używaj arkusza innej instancji).
+2. Utwórz nowy projekt w [Google Apps Script](https://script.google.com) i wgraj pliki `Kod.gs` i `Index.html`.
+3. Ustaw Script Properties (patrz wyżej i `.env.example`).
+4. `Wdróż → Nowe wdrożenie → Aplikacja internetowa` → dostęp: `Wszyscy`.
+5. Skopiuj URL wdrożenia do zmiennych środowiskowych Netlify.
+6. Zapoznaj się z [`SECURITY.md`](SECURITY.md) przed uruchomieniem produkcyjnym — projekt przechowuje dane osobowe (w tym dzieci), więc wymaga podstawowego utwardzenia zabezpieczeń.
 
 ---
 
-## Struktura arkuszy
+## Bezpieczeństwo
 
-| Arkusz | Kolumny |
-|---|---|
-| `Hasła` | ID, Imię i Nazwisko, Hasło, Rola |
-| `Karty_RFID` | UID karty, ID ministranta, Imię i Nazwisko, Aktywna |
-| `Zdarzenia_czytnika` | Kod, Nazwa, Punkty, Aktywne |
-| `Logi_czytnik` | Data, ID, Imię i Nazwisko, Czytnik, Wydarzenie, Punkty |
-| `Sesje_urzadzen` | DeviceID, UserID, Token, Imię, Rola, DataWażności |
+Ten projekt przechowuje dane osobowe, w tym dane małoletnich. Przed wdrożeniem produkcyjnym zapoznaj się z [`SECURITY.md`](SECURITY.md). Jeśli znajdziesz podatność, zgłoś ją zgodnie z instrukcją w tym pliku — **nie publikuj jej w publicznym issue**.
 
 ---
 
 ## Licencja
 
-Projekt prywatny — wszelkie prawa zastrzeżone.  
-© Mateusz Droż / Parafia Najświętszej Maryi Panny Nieustającej Pomocy
+Projekt udostępniony na licencji **GPL-2.0**. Pełny tekst licencji znajduje się w pliku [`LICENSE`](LICENSE). W skrócie: możesz swobodnie używać, modyfikować i rozpowszechniać ten kod, ale każda rozpowszechniana modyfikacja musi być udostępniona na tych samych warunkach (copyleft) wraz z kodem źródłowym.
