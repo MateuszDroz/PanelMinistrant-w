@@ -1,0 +1,791 @@
+// ============================================================
+// SYSTEM PUNKTOWY RFID DLA MINISTRANTOW - ESP32
+// Kolizja mszy: * = dalej, # = OK  |  LCD tylko ASCII
+//
+// POPRAWKI W TEJ WERSJI (patrz komentarze "// >>> FIX"):
+//  1) WEBAPP_URL byl INNY niz w Checkin.html / panelu (index.html) —
+//     ESP32 gadal ze STARYM wdrozeniem Apps Script, ktore mogло nie
+//     miec najnowszej logiki (np. trybu skanowania UID przy dodawaniu
+//     ministranta). To byla najbardziej prawdopodobna przyczyna, ze
+//     "tryb skanowania nie dziala". URL zostal zsynchronizowany.
+//  2) Rozroznianie "prawdziwe odbicie karty" vs "ID wpisane recznie"
+//     nie opieralo sie juz o zgadywanie po tym czy UID sklada sie
+//     z samych cyfr (zawodne — karta tez moze miec taki UID), tylko
+//     o jawny parametr manual=0/1 wysylany do serwera.
+//  3) Duzo dokladniejsze komunikaty bledow na LCD (kod HTTP, przyczyna
+//     bledu polaczenia, kod bledu z serwera) — zeby wiedziec o co
+//     chodzi bez podlaczania kabla USB / Serial Monitora.
+//  4) Zdalne raportowanie bledow na serwer (action=err) — kazdy blad
+//     polaczenia/serwera jest tez wysylany (best-effort, po WiFi) do
+//     Apps Script, wiec admin moze je podejrzec zdalnie z panelu,
+//     zamiast podlaczac urzadzenie kablem.
+//  5) Ekran diagnostyczny dostepny WYLACZNIE z menu serwisowego po
+//     zeskanowaniu karty admina: pokazuje IP, sile sygnalu WiFi
+//     i ostatni blad. Usunieto skrot klawiszowy 'd' z ekranu glownego
+//     (diagnostyka nie jest juz dostepna bez karty admina).
+// ============================================================
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Keypad.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+const char* WIFI_SSID     = "DANE_WRAŻLIWE";
+const char* WIFI_PASSWORD = "DANE_WRAŻLIWE";
+
+// >>> FIX: to byl inny URL niz w Checkin.html/index.html (stare wdrozenie
+// Apps Script). Ustaw TU zawsze ten sam URL co w Checkin.html/index.html —
+// najlepiej trzymaj go w jednym miejscu i pilnuj przy kazdym nowym
+// wdrozeniu ("Wdroz > Zarzadzaj wdrozeniami"), bo kazde nowe wdrozenie
+// z NOWYM ID zrywa zgodnosc, dopoki nie zaktualizujesz URL wszedzie.
+const char* WEBAPP_URL    = "DANE_WRAŻLIWE";
+const char* DEVICE_ID     = "DANE_WRAŻLIWE";
+
+// >>> NOWE: UID karty admina — jej przyłożenie na ekranie glownym (nie w
+// trakcie innej operacji) uruchamia lokalny tryb serwisowy zamiast normalnego
+// zaliczania obecnosci. Karta admina NIE jest wtedy wysylana na serwer jako
+// zwykle odbicie. UID zawsze porownywany wielkimi literami (tak jak budowany
+// jest string uid ponizej, przez sprintf "%02X").
+const char* ADMIN_UID = "113B6069";
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+MFRC522 rfid(21, 22);
+
+const byte ROWS = 4;
+const byte COLS = 4;
+char keys[ROWS][COLS] = {
+  {'c', 'd', 'b', 'a'},
+  {'9', '#', '6', '3'},
+  {'8', '0', '5', '2'},
+  {'7', '*', '4', '1'}
+};
+byte rowPins[ROWS] = {26, 25, 33, 32};
+byte colPins[COLS] = {13, 12, 14, 27};
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+const int greenLed = 17;
+const int redLed = 5;
+const int buzzer = 4;
+
+enum SystemState { WAITING_FOR_CARD, WAITING_FOR_MANUAL_ID, WAITING_FOR_CHOICE, SERVICE_MODE };
+SystemState currentState = WAITING_FOR_CARD;
+String manualIdBuffer = "";
+const int MAX_DLUGOSC_ID = 10;
+unsigned long czasWejsciaWTrybRecznyId = 0;
+const unsigned long TIMEOUT_WPROWADZANIA = 15000UL;
+String pendingUidOrId = "";
+bool pendingIsManual = false;
+
+struct OpcjaSlotu { String kod; String nazwa; int punkty; };
+OpcjaSlotu opcjeBuf[6];
+int opcjeLiczba = 0;
+int opcjeIndex = 0;
+unsigned long czasWejsciaWWybor = 0;
+
+// >>> FIX: pamiec ostatniego bledu, widoczna na ekranie diagnostycznym
+// (dostepnym z menu serwisowego), zeby dalo sie zdiagnozowac problem w terenie.
+String ostatniKodBledu = "brak";
+String ostatniOpisBledu = "-";
+unsigned long ostatniBladCzas = 0;
+
+// >>> NOWE: tryb serwisowy (po zeskanowaniu karty admina)
+const int SERWIS_LICZBA_OPCJI = 5;
+const char* SERWIS_NAZWY[SERWIS_LICZBA_OPCJI] = {
+  "Diagnostyka WiFi",
+  "Test polaczenia",
+  "Restart WiFi",
+  "Restart urzadz.",
+  "Wyjscie"
+};
+int serwisIndex = 0;
+unsigned long czasWejsciaWSerwis = 0;
+const unsigned long TIMEOUT_SERWIS = 60000UL;
+
+// UTF-8 polskie -> ASCII, reszta nie-ASCII odpada
+String lcdSafe(const String& s) {
+  String out;
+  out.reserve(16);
+  for (unsigned int i = 0; i < s.length() && out.length() < 16; ) {
+    unsigned char c = (unsigned char)s[i];
+    if (c < 0x80) {
+      if (c >= 32 && c <= 126) out += (char)c;
+      i++;
+      continue;
+    }
+    // 2-bajtowe UTF-8 (C3 xx = latynskie z ogonkami)
+    if ((c & 0xE0) == 0xC0 && i + 1 < s.length()) {
+      unsigned char c2 = (unsigned char)s[i + 1];
+      char repl = '?';
+      if (c == 0xC3) {
+        // Ó ó (i podobne z C3)
+        if (c2 == 0x93 || c2 == 0xB3) repl = 'o';
+        else if (c2 == 0x81 || c2 == 0xA1) repl = 'a';
+        else repl = '?';
+      } else if (c == 0xC4) {
+        // Ą ą Ć ć Ę ę Ł ł
+        if (c2 == 0x84 || c2 == 0x85) repl = 'a';
+        else if (c2 == 0x86 || c2 == 0x87) repl = 'c';
+        else if (c2 == 0x98 || c2 == 0x99) repl = 'e';
+        else if (c2 == 0x81 || c2 == 0x82) repl = 'l'; // Ł ł (C4 81/82)
+        else if (c2 == 0xBB || c2 == 0xBC) repl = 'l';
+        else repl = '?';
+      } else if (c == 0xC5) {
+        // Ń ń Ś ś Ź ź Ż ż
+        if (c2 == 0x83 || c2 == 0x84) repl = 'n'; // Ń ń
+        else if (c2 == 0x9A || c2 == 0x9B) repl = 's'; // Ś ś
+        else if (c2 == 0xB9 || c2 == 0xBA) repl = 'z'; // Ź ź
+        else if (c2 == 0xBB || c2 == 0xBC) repl = 'z'; // Ż ż
+        else if (c2 == 0x81 || c2 == 0x82) repl = 'l';
+        else repl = '?';
+      }
+      if (repl != '?') out += repl;
+      i += 2;
+      continue;
+    }
+    // 3-bajtowe — pomiń
+    if ((c & 0xF0) == 0xE0 && i + 2 < s.length()) { i += 3; continue; }
+    if ((c & 0xF8) == 0xF0 && i + 3 < s.length()) { i += 4; continue; }
+    i++;
+  }
+  return out;
+}
+
+String urlEncode(const String& s) {
+  String out;
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+      out += c;
+    } else {
+      char buf[4];
+      sprintf(buf, "%%%02X", (unsigned char)c);
+      out += buf;
+    }
+  }
+  return out;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(greenLed, OUTPUT);
+  pinMode(redLed, OUTPUT);
+  pinMode(buzzer, OUTPUT);
+  digitalWrite(greenLed, LOW);
+  digitalWrite(redLed, LOW);
+  noTone(buzzer);
+  SPI.begin(18, 35, 23, 21);
+  rfid.PCD_Init();
+  Wire.begin(19, 16);
+  lcd.init();
+  lcd.backlight();
+  polaczZWiFi();
+  resetSystem();
+}
+
+void loop() {
+  if (currentState == WAITING_FOR_CARD) obslugaWaitingForCard();
+  else if (currentState == WAITING_FOR_MANUAL_ID) obslugaWaitingForManualId();
+  else if (currentState == WAITING_FOR_CHOICE) obslugaWyboruSlotu();
+  else if (currentState == SERVICE_MODE) obslugaTrybuSerwisowego();
+}
+
+void polaczZWiFi() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Laczenie WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int proby = 0;
+  while (WiFi.status() != WL_CONNECTED && proby < 40) {
+    delay(500);
+    proby++;
+  }
+  lcd.clear();
+  if (WiFi.status() == WL_CONNECTED) {
+    lcd.print("WiFi OK");
+    lcd.setCursor(0, 1);
+    // >>> FIX: pokaz IP od razu po polaczeniu — latwa diagnostyka bez kabla
+    lcd.print(WiFi.localIP().toString());
+    delay(1200);
+  } else {
+    lcd.print("Brak WiFi!");
+    lcd.setCursor(0, 1);
+    lcd.print("Sprawdz haslo/SSID");
+    zglosBladZdalnie("wifi_brak", "Nie polaczono z " + String(WIFI_SSID));
+    delay(1600);
+  }
+}
+
+void sprawdzWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+    delay(300);
+  }
+}
+
+// >>> FIX: centralna funkcja zapisujaca i pokazujaca blad, zamiast rozrzuconych
+// generycznych komunikatow. Zawsze zapamietuje kod+opis (do ekranu diagnostyki
+// w menu serwisowym) i, jesli to mozliwe, wysyla go na serwer (zdalna
+// diagnostyka po WiFi).
+void ustawOstatniBlad(const String& kod, const String& opis) {
+  ostatniKodBledu = kod;
+  ostatniOpisBledu = opis;
+  ostatniBladCzas = millis();
+  Serial.print("[BLAD] "); Serial.print(kod); Serial.print(": "); Serial.println(opis);
+}
+
+// Best-effort: probuje wyslac blad na serwer, zeby admin widzial go zdalnie
+// (dziala tylko jesli jest WiFi/internet — nie blokuje dzialania urzadzenia).
+void zglosBladZdalnie(const String& kod, const String& opis) {
+  ustawOstatniBlad(kod, opis);
+  if (WiFi.status() != WL_CONNECTED) return;
+  String url = String(WEBAPP_URL) + "?action=err";
+  url += "&device=" + urlEncode(String(DEVICE_ID));
+  url += "&kod=" + urlEncode(kod);
+  url += "&msg=" + urlEncode(opis);
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(6000);
+  http.setConnectTimeout(4000);
+  if (http.begin(client, url)) {
+    http.GET(); // ignorujemy wynik — to tylko najlepszy-mozliwy log
+    http.end();
+  }
+}
+
+// >>> NOWE: wspolna funkcja wykonujaca GET do Apps Script z pojedynczym
+// automatycznym powtorzeniem.
+// Blad "sieciowy -1" (HTTPC_ERROR_CONNECTION_FAILED) na ESP32 najczesciej
+// bierze sie z tego, ze WiFiClientSecure/NetworkClientSecure ma za malo
+// wolnego RAM na uchwyt TLS w danym momencie (LCD+RFID+Keypad+ArduinoJson
+// zajmuja sporo heapu), albo z chwilowej niestabilnosci polaczenia z
+// serwerem Google. Jedna proba ponowienia po krotkiej przerwie (z pelnym
+// ponownym polaczeniem WiFi) eliminuje wiekszosc takich przypadkow.
+// (Uwaga: metoda setBufferSizes() dostepna w starszych rdzeniach ESP32 nie
+// istnieje w nowszym rdzeniu Arduino-ESP32 3.x, gdzie WiFiClientSecure to
+// alias NetworkClientSecure — dlatego jej tu nie uzywamy, dla kompatybilnosci
+// z obiema wersjami rdzenia.)
+int wykonajGET(const String& url, String& outBody, String& outOpis) {
+  sprawdzWiFi();
+  if (WiFi.status() != WL_CONNECTED) {
+    outOpis = "Brak WiFi";
+    return -100;
+  }
+  for (int proba = 1; proba <= 2; proba++) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(20000);
+    http.setConnectTimeout(10000);
+    if (!http.begin(client, url)) {
+      outOpis = "Zly URL";
+      return -101;
+    }
+    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    int kod = http.GET();
+    if (kod > 0) {
+      outBody = http.getString();
+      http.end();
+      return kod;
+    }
+    // Blad polaczenia — zaloguj szczegoly (w tym wolny heap, przydatne przy
+    // diagnozowaniu "sieciowy -1") i sprobuj raz jeszcze po krotkiej przerwie.
+    outOpis = http.errorToString(kod) + " (heap:" + String(ESP.getFreeHeap() / 1024) + "KB)";
+    http.end();
+    Serial.print("[HTTP proba "); Serial.print(proba); Serial.print("] kod=");
+    Serial.print(kod); Serial.print(" opis="); Serial.println(outOpis);
+    if (proba == 1) {
+      WiFi.reconnect();
+      delay(600);
+    } else {
+      return kod;
+    }
+  }
+  return -1;
+}
+
+void obslugaWaitingForCard() {
+  char key = keypad.getKey();
+  if (key == '#') {
+    tone(buzzer, 1800, 40);
+    rozpocznijTrybRecznegoId();
+    return;
+  }
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    String uid = "";
+    char bufBajt[3];
+    for (byte i = 0; i < rfid.uid.size; i++) {
+      sprintf(bufBajt, "%02X", rfid.uid.uidByte[i]);
+      uid += bufBajt;
+    }
+    rfid.PICC_HaltA();
+    // >>> NOWE: karta admina na ekranie glownym -> tryb serwisowy lokalnie,
+    // BEZ wysylania jej jako zwykle odbicie na serwer.
+    if (uid.equalsIgnoreCase(ADMIN_UID)) {
+      tone(buzzer, 1500, 60); delay(80);
+      tone(buzzer, 2000, 100);
+      wejdzWTrybSerwisowy();
+      return;
+    }
+    tone(buzzer, 1200, 120);
+    pendingUidOrId = uid;
+    pendingIsManual = false;
+    wyslijZapytanie(uid, "", false);
+  }
+}
+
+// >>> FIX: ekran diagnostyczny — pokazuje kolejno IP+RSSI, wolny heap
+// (pomocne przy bledzie "sieciowy -1", ktory czesto wynika z braku RAM na
+// uchwyt TLS) oraz ostatni zarejestrowany blad. Dostepny WYLACZNIE z menu
+// serwisowego (po zeskanowaniu karty admina). Wyjscie: dowolny klawisz
+// albo timeout.
+void pokazDiagnostyke() {
+  unsigned long start = millis();
+  int ekran = 0;
+  while (millis() - start < 9000) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    if (ekran == 0) {
+      lcd.print("IP: ");
+      lcd.print(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("brak WiFi"));
+      lcd.setCursor(0, 1);
+      lcd.print("RSSI: ");
+      lcd.print(WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) + " dBm" : "-");
+    } else if (ekran == 1) {
+      lcd.print("Wolny heap:");
+      lcd.setCursor(0, 1);
+      lcd.print(String(ESP.getFreeHeap() / 1024) + " KB");
+    } else {
+      lcd.print("Ost.blad: ");
+      lcd.print(ostatniKodBledu.substring(0, 6));
+      lcd.setCursor(0, 1);
+      lcd.print(lcdSafe(ostatniOpisBledu));
+    }
+    unsigned long t0 = millis();
+    while (millis() - t0 < 2500) {
+      if (keypad.getKey()) { resetSystem(); return; }
+      delay(20);
+    }
+    ekran = (ekran + 1) % 3;
+  }
+  resetSystem();
+}
+
+// ============================================================
+// >>> NOWE: TRYB SERWISOWY (po zeskanowaniu karty admina)
+// ============================================================
+void wejdzWTrybSerwisowy() {
+  serwisIndex = 0;
+  czasWejsciaWSerwis = millis();
+  currentState = SERVICE_MODE;
+  pokazMenuSerwisowe();
+}
+
+void pokazMenuSerwisowe() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("SERWIS ");
+  lcd.print(String(serwisIndex + 1) + "/" + String(SERWIS_LICZBA_OPCJI));
+  lcd.setCursor(0, 1);
+  lcd.print(String(SERWIS_NAZWY[serwisIndex]).substring(0, 16));
+}
+
+void obslugaTrybuSerwisowego() {
+  if (millis() - czasWejsciaWSerwis > TIMEOUT_SERWIS) {
+    tone(buzzer, 300, 200);
+    resetSystem();
+    return;
+  }
+  char key = keypad.getKey();
+  if (!key) return;
+  czasWejsciaWSerwis = millis();
+  if (key == '*') {
+    tone(buzzer, 1200, 40);
+    serwisIndex = (serwisIndex + 1) % SERWIS_LICZBA_OPCJI;
+    pokazMenuSerwisowe();
+    return;
+  }
+  if (key == '#') {
+    tone(buzzer, 1800, 50);
+    wykonajOpcjeSerwisowa(serwisIndex);
+    return;
+  }
+}
+
+void wykonajOpcjeSerwisowa(int idx) {
+  // 0 = Diagnostyka WiFi
+  if (idx == 0) {
+    pokazDiagnostyke();
+    // pokazDiagnostyke() konczy przez resetSystem() lub timeout -> wracamy
+    // do trybu WAITING_FOR_CARD, wiec dla spojnosci menu po prostu wychodzimy.
+    return;
+  }
+  // 1 = Test polaczenia z serwerem (Apps Script)
+  if (idx == 1) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Testuje...");
+    String body, opis;
+    int kod = wykonajGET(String(WEBAPP_URL) + "?action=config", body, opis);
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    if (kod == 200) {
+      lcd.print("Polaczenie OK");
+      lcd.setCursor(0, 1);
+      lcd.print("HTTP 200");
+    } else {
+      lcd.print(("Blad: " + String(kod)).substring(0, 16));
+      lcd.setCursor(0, 1);
+      lcd.print(lcdSafe(opis));
+    }
+    delay(2500);
+    czasWejsciaWSerwis = millis();
+    pokazMenuSerwisowe();
+    return;
+  }
+  // 2 = Restart WiFi
+  if (idx == 2) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Restart WiFi...");
+    WiFi.disconnect(true);
+    delay(500);
+    polaczZWiFi();
+    czasWejsciaWSerwis = millis();
+    pokazMenuSerwisowe();
+    return;
+  }
+  // 3 = Restart urzadzenia
+  if (idx == 3) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Restart...");
+    delay(600);
+    ESP.restart();
+    return;
+  }
+  // 4 = Wyjscie
+  resetSystem();
+}
+
+void rozpocznijTrybRecznegoId() {
+  manualIdBuffer = "";
+  czasWejsciaWTrybRecznyId = millis();
+  currentState = WAITING_FOR_MANUAL_ID;
+  pokazEkranRecznegoId();
+}
+
+void obslugaWaitingForManualId() {
+  if (millis() - czasWejsciaWTrybRecznyId > TIMEOUT_WPROWADZANIA) {
+    tone(buzzer, 300, 200);
+    resetSystem();
+    return;
+  }
+  char key = keypad.getKey();
+  if (!key) return;
+  czasWejsciaWTrybRecznyId = millis();
+  if (key == '*') {
+    if (manualIdBuffer.length() > 0) {
+      tone(buzzer, 900, 40);
+      manualIdBuffer.remove(manualIdBuffer.length() - 1);
+      pokazEkranRecznegoId();
+    } else {
+      tone(buzzer, 300, 200);
+      resetSystem();
+    }
+    return;
+  }
+  if (key == '#') {
+    if (manualIdBuffer.length() == 0) {
+      tone(buzzer, 300, 150);
+      return;
+    }
+    tone(buzzer, 1800, 40);
+    pendingUidOrId = manualIdBuffer;
+    pendingIsManual = true;
+    wyslijZapytanie(manualIdBuffer, "", true);
+    return;
+  }
+  if (key >= '0' && key <= '9') {
+    if (manualIdBuffer.length() < MAX_DLUGOSC_ID) {
+      tone(buzzer, 1800, 40);
+      manualIdBuffer += key;
+      pokazEkranRecznegoId();
+    } else {
+      tone(buzzer, 300, 100);
+    }
+  }
+}
+
+void pokazEkranRecznegoId() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Wpisz ID:");
+  lcd.setCursor(0, 1);
+  if (manualIdBuffer.length() == 0) lcd.print("*-Anuluj #-OK");
+  else lcd.print(manualIdBuffer);
+}
+
+void wyslijZapytanie(String idParam, String kodSlotu, bool isManual) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Wysylanie...");
+  sprawdzWiFi();
+  if (WiFi.status() != WL_CONNECTED) {
+    pokazBladPolaczenia("Brak WiFi", "Sprawdz sygnal/haslo");
+    return;
+  }
+  String url = String(WEBAPP_URL) + "?device=" + urlEncode(String(DEVICE_ID));
+  url += "&id=" + urlEncode(idParam);
+  if (kodSlotu.length() > 0) {
+    url += "&type=" + urlEncode(kodSlotu);
+  }
+  // >>> FIX: jawna flaga, zamiast zgadywania po serwerze czy UID to same cyfry.
+  // Pozwala serwerowi bezblednie odroznic prawdziwe odbicie karty (0) od
+  // ID wpisanego recznie z klawiatury (1) — potrzebne m.in. dla trybu
+  // skanowania UID przy dodawaniu nowego ministranta.
+  url += "&manual=" + String(isManual ? "1" : "0");
+
+  String odpowiedz, opisSieciowy;
+  int kodHttp = wykonajGET(url, odpowiedz, opisSieciowy);
+  if (kodHttp <= 0) {
+    // ujemne kody HTTPClient = blad polaczenia/timeout/TLS, nie odpowiedz serwera
+    pokazBladPolaczenia("Sieciowy " + String(kodHttp), opisSieciowy);
+    return;
+  }
+  if (kodHttp != 200) {
+    // >>> FIX: pokazuj prawdziwy kod HTTP (404 = zly/skasowany URL wdrozenia,
+    // 302 = przekierowanie logowania Google = zle ustawienia dostepu w
+    // appsscript.json, 500 = blad w Kod.gs) zamiast "Brak polaczenia".
+    pokazBladPolaczenia("HTTP " + String(kodHttp), opisKoduHttp(kodHttp));
+    return;
+  }
+  Serial.println(odpowiedz);
+  if (odpowiedz.length() == 0) {
+    pokazBladPolaczenia("Puste HTTP200", "Serwer OK, brak tresci");
+    return;
+  }
+  // Wiekszy bufor — opcje wyboru msz
+  DynamicJsonDocument doc(2048);
+  DeserializationError errJson = deserializeJson(doc, odpowiedz);
+  if (errJson) {
+    // >>> FIX: pokaz konkretny powod bledu parsowania + poczatek odpowiedzi,
+    // zamiast ogolnikowego "Serwer zwrocil nieprawidlowa odpowiedz".
+    pokazBladPolaczenia("Zly JSON", String(errJson.c_str()));
+    Serial.print("Tresc odpowiedzi (poczatek): ");
+    Serial.println(odpowiedz.substring(0, 200));
+    return;
+  }
+  bool sukces = doc["sukces"] | false;
+  bool skan = doc["skan"] | false;
+  const char* bladC = doc["blad"];
+  String blad = bladC ? String(bladC) : "";
+  if (sukces && skan) {
+    const char* uidC = doc["uid"];
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("UID zapisany");
+    lcd.setCursor(0, 1);
+    lcd.print(lcdSafe(uidC ? String(uidC) : ""));
+    digitalWrite(greenLed, HIGH);
+    tone(buzzer, 1000, 80); delay(100);
+    tone(buzzer, 1600, 120);
+    delay(1400);
+    digitalWrite(greenLed, LOW);
+    resetSystem();
+    return;
+  }
+  // Kolizja godzin — wybor
+  if (!sukces && blad == "wybor_wymagany") {
+    opcjeLiczba = 0;
+    JsonArray arr = doc["opcje"].as<JsonArray>();
+    for (JsonObject o : arr) {
+      if (opcjeLiczba >= 6) break;
+      const char* k = o["kod"];
+      // Preferuj nazwaLcd (ASCII z serwera), potem nazwa
+      const char* nLcd = o["nazwaLcd"];
+      const char* n = o["nazwa"];
+      String label = nLcd ? String(nLcd) : (n ? String(n) : "Opcja");
+      opcjeBuf[opcjeLiczba].kod = k ? String(k) : "";
+      opcjeBuf[opcjeLiczba].nazwa = lcdSafe(label);
+      opcjeBuf[opcjeLiczba].punkty = o["punkty"] | 0;
+      opcjeLiczba++;
+    }
+    if (opcjeLiczba == 0) {
+      badEffect("Brak opcji");
+      delay(1400);
+      resetSystem();
+      return;
+    }
+    opcjeIndex = 0;
+    czasWejsciaWWybor = millis();
+    currentState = WAITING_FOR_CHOICE;
+    tone(buzzer, 1400, 60);
+    pokazOpcjeNaLcd();
+    return;
+  }
+  if (sukces) {
+    const char* imieC = doc["imie"];
+    const char* wydC = doc["wydarzenie"];
+    int punkty = doc["punkty"] | 0;
+    String line1 = lcdSafe(imieC ? String(imieC) : "OK");
+    String line2 = "+" + String(punkty) + " pkt";
+    if (wydC) {
+      String w = lcdSafe(String(wydC));
+      if (w.length() > 0 && w.length() <= 16) {
+        // druga linia: +pkt, imie na 1
+      }
+    }
+    goodEffect(line1, punkty);
+  } else {
+    // >>> FIX: jesli serwer przyslal wlasny "wiadomosc", pokaz ja (2 linie,
+    // przewijana skrocona wersja w Serial) zamiast tylko krotkiego kodu.
+    const char* wiadC = doc["wiadomosc"];
+    String wiad = wiadC ? String(wiadC) : "";
+    ustawOstatniBlad(blad.length() ? blad : "nieznany", wiad.length() ? wiad : zmapujBlad(blad));
+    badEffect(zmapujBlad(blad));
+    if (wiad.length()) { Serial.print("[SERWER] "); Serial.println(wiad); }
+  }
+  delay(2000);
+  resetSystem();
+}
+
+// >>> FIX: krotki, ale konkretny opis typowych kodow HTTP spotykanych przy
+// Apps Script Web Apps, zeby od razu wiedziec co sprawdzic.
+String opisKoduHttp(int kod) {
+  if (kod == 404) return "Zly/usuniety URL";
+  if (kod == 302 || kod == 401 || kod == 403) return "Zly dostep wdrozenia";
+  if (kod == 500) return "Blad w Kod.gs";
+  if (kod == 429) return "Limit zapytan";
+  return "Sprawdz wdrozenie";
+}
+
+void pokazOpcjeNaLcd() {
+  lcd.clear();
+  // Linia 1: "1/2 Msza 7:00"
+  String l1 = String(opcjeIndex + 1) + "/" + String(opcjeLiczba) + " ";
+  String rest = opcjeBuf[opcjeIndex].nazwa;
+  // jesli nazwa juz ma +pkt, nie dokladaj
+  if (rest.indexOf('+') < 0 && opcjeBuf[opcjeIndex].punkty != 0) {
+    String withP = rest + " +" + String(opcjeBuf[opcjeIndex].punkty);
+    if (withP.length() <= 13) rest = withP; // 16 - "1/2 " = 13? actually "1/2 " is 4 chars
+  }
+  l1 += rest;
+  lcd.setCursor(0, 0);
+  lcd.print(l1.substring(0, 16));
+  // Linia 2: sterowanie
+  lcd.setCursor(0, 1);
+  lcd.print("*=dalej  #=OK");
+}
+
+void obslugaWyboruSlotu() {
+  if (millis() - czasWejsciaWWybor > 45000UL) {
+    tone(buzzer, 300, 200);
+    resetSystem();
+    return;
+  }
+  char key = keypad.getKey();
+  if (!key) return;
+  czasWejsciaWWybor = millis();
+  if (key == '*') {
+    tone(buzzer, 1200, 40);
+    opcjeIndex = (opcjeIndex + 1) % opcjeLiczba;
+    pokazOpcjeNaLcd();
+    return;
+  }
+  if (key == '#') {
+    tone(buzzer, 1800, 50);
+    String kod = opcjeBuf[opcjeIndex].kod;
+    if (kod.length() == 0) {
+      badEffect("Zly kod");
+      delay(1200);
+      resetSystem();
+      return;
+    }
+    wyslijZapytanie(pendingUidOrId, kod, pendingIsManual);
+    return;
+  }
+  // cyfry 1-6 = szybki wybor
+  if (key >= '1' && key <= '6') {
+    int idx = key - '1';
+    if (idx < opcjeLiczba) {
+      tone(buzzer, 1800, 50);
+      opcjeIndex = idx;
+      wyslijZapytanie(pendingUidOrId, opcjeBuf[opcjeIndex].kod, pendingIsManual);
+    }
+  }
+}
+
+// >>> FIX: teraz przyjmuje konkretny kod i opis, zamiast jednego stalego
+// tekstu dla kazdej przyczyny bledu polaczenia. Zglasza tez blad zdalnie.
+void pokazBladPolaczenia(String kod, String opis) {
+  zglosBladZdalnie(kod, opis);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(lcdSafe(kod).substring(0, 16));
+  lcd.setCursor(0, 1);
+  lcd.print(lcdSafe(opis).substring(0, 16));
+  digitalWrite(redLed, HIGH);
+  tone(buzzer, 150, 550);
+  delay(1800);
+  digitalWrite(redLed, LOW);
+  resetSystem();
+}
+
+String zmapujBlad(String kodBledu) {
+  if (kodBledu == "nieznana_karta") return "Nieznana karta!";
+  if (kodBledu == "karta_nieaktywna") return "Karta nieakt.";
+  if (kodBledu == "nieznane_id") return "Nieznane ID!";
+  if (kodBledu == "brak_id" || kodBledu == "brak_uid") return "Brak ID!";
+  if (kodBledu == "brak_wydarzenia") return "Brak mszy teraz";
+  if (kodBledu == "juz_zaliczone") return "Juz zaliczone";
+  if (kodBledu == "nieznane_wydarzenie") return "Zly wybor";
+  // >>> FIX: nieznany/niezmapowany kod bledu pokazuje sam kod (skrocony),
+  // zamiast zawsze tego samego "Blad serwera" bez informacji o przyczynie.
+  if (kodBledu.length() > 0) return ("Blad: " + kodBledu).substring(0, 16);
+  return "Blad serwera";
+}
+
+void goodEffect(String imie, int punkty) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(lcdSafe(imie).substring(0, 16));
+  lcd.setCursor(0, 1);
+  lcd.print("+" + String(punkty) + " pkt");
+  digitalWrite(greenLed, HIGH);
+  tone(buzzer, 1000, 100); delay(120);
+  tone(buzzer, 1400, 100); delay(120);
+  tone(buzzer, 1900, 220);
+  delay(900);
+  digitalWrite(greenLed, LOW);
+}
+
+void badEffect(String message) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(lcdSafe(message).substring(0, 16));
+  lcd.setCursor(0, 1);
+  // >>> FIX: druga linia LCD pokazuje kod bledu, dawniej byla pusta.
+  lcd.print(lcdSafe(ostatniKodBledu).substring(0, 16));
+  digitalWrite(redLed, HIGH);
+  tone(buzzer, 150, 550);
+  delay(800);
+  digitalWrite(redLed, LOW);
+}
+
+void resetSystem() {
+  currentState = WAITING_FOR_CARD;
+  manualIdBuffer = "";
+  pendingUidOrId = "";
+  opcjeLiczba = 0;
+  opcjeIndex = 0;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Zbliz karte");
+  lcd.setCursor(0, 1);
+  lcd.print("#=ID");
+}
