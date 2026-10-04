@@ -108,4 +108,4 @@ Ten projekt przechowuje dane osobowe, w tym dane małoletnich. Zapoznaj się z [
 
 ## Licencja
 
-Projekt udostępniony na licencji **GPL-2.0**. Pełny tekst licencji znajduje się w pliku [`LICENSE`](LICENSE). W skrócie: możesz swobodnie używać, modyfikować i rozpowszechniać ten kod, ale każda rozpowszechniana modyfikacja musi być udostępniona na tych samych warunkach (copyleft) wraz z kodem źródłowym.
+Projekt udostępniony na licencji **All Rights Reserved**. Pełny tekst licencji znajduje się w pliku [`LICENSE`](LICENSE).
