@@ -1,0 +1,2634 @@
+// ============================================================
+// SYSTEM PUNKTOWY RFID DLA MINISTRANTOW - ESP32
+// Kolizja mszy: * = dalej, # = OK  |  LCD tylko ASCII
+//
+//  - Klawiatura: A->7, B->8, D->9; fizyczne 7/8/9 nieme
+//  - Auto-reset codziennie o 3:00 (naprawa LCD/I2C)
+//  - Tryb serwisowy z karty admina
+//  - Zdalne raportowanie bledow (action=err)
+//  - OTA przez WiFi: http://IP_ESP32/update
+// ============================================================
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Keypad.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <time.h>
+
+// ============================================================
+// KONFIGURACJA
+// ============================================================
+
+const char* WIFI_SSID     = "DANE_WRAŻLIWE";
+const char* WIFI_PASSWORD = "DANE_WRAŻLIWE";
+
+const char* WEBAPP_URL =
+  ""DANE_WRAŻLIWE";
+
+const char* DEVICE_ID = "Zakrystia";
+const char* ADMIN_UID = "DANE_WRAŻLIWE";
+
+// ============================================================
+// OTA
+// ============================================================
+
+WebServer otaServer(80);
+
+// ============================================================
+// LCD / RFID
+// ============================================================
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+MFRC522 rfid(21, 22);
+
+// ============================================================
+// KLAWIATURA
+// ============================================================
+
+const byte ROWS = 4;
+const byte COLS = 4;
+
+char keys[ROWS][COLS] = {
+  {'c', '9', '8', '7'},
+  {'x', '#', '6', '3'},
+  {'y', '0', '5', '2'},
+  {'z', '*', '4', '1'}
+};
+
+byte rowPins[ROWS] = {26, 25, 33, 32};
+byte colPins[COLS] = {13, 12, 14, 27};
+
+Keypad keypad = Keypad(
+  makeKeymap(keys),
+  rowPins,
+  colPins,
+  ROWS,
+  COLS
+);
+
+// ============================================================
+// PINY
+// ============================================================
+
+const int greenLed = 17;
+const int redLed   = 5;
+const int buzzer   = 4;
+
+// ============================================================
+// STANY
+// ============================================================
+
+enum SystemState {
+  WAITING_FOR_CARD,
+  WAITING_FOR_MANUAL_ID,
+  WAITING_FOR_CHOICE,
+  SERVICE_MODE
+};
+
+SystemState currentState = WAITING_FOR_CARD;
+
+String manualIdBuffer = "";
+
+const int MAX_DLUGOSC_ID = 10;
+
+unsigned long czasWejsciaWTrybRecznyId = 0;
+const unsigned long TIMEOUT_WPROWADZANIA = 15000UL;
+
+String pendingUidOrId = "";
+bool pendingIsManual = false;
+
+// ============================================================
+// OPCJE
+// ============================================================
+
+struct OpcjaSlotu {
+  String kod;
+  String nazwa;
+  int punkty;
+};
+
+OpcjaSlotu opcjeBuf[6];
+
+int opcjeLiczba = 0;
+int opcjeIndex = 0;
+
+unsigned long czasWejsciaWWybor = 0;
+
+// ============================================================
+// BLEDY
+// ============================================================
+
+String ostatniKodBledu = "brak";
+String ostatniOpisBledu = "-";
+unsigned long ostatniBladCzas = 0;
+
+// ============================================================
+// SERWIS
+// ============================================================
+
+const int SERWIS_LICZBA_OPCJI = 5;
+
+const char* SERWIS_NAZWY[SERWIS_LICZBA_OPCJI] = {
+  "Diagnostyka WiFi",
+  "Test polaczenia",
+  "Restart WiFi",
+  "Restart urzadz.",
+  "Wyjscie"
+};
+
+int serwisIndex = 0;
+
+unsigned long czasWejsciaWSerwis = 0;
+
+const unsigned long TIMEOUT_SERWIS = 60000UL;
+
+// ============================================================
+// CZAS
+// ============================================================
+
+bool czasZsynchronizowany = false;
+
+// Zmienne RTC - przezywaja ESP.restart()
+RTC_DATA_ATTR int bootCount = 0;
+RTC_DATA_ATTR int lastAutoResetDayKey = 0;
+
+// Circuit breaker - wylacza auto-reset przy petli bootowania
+bool autoResetEnabled = true;
+// RTC_DATA_ATTR - zmienna przezywa ESP.restart()
+
+// ============================================================
+// PROTOTYPY
+// ============================================================
+
+void zsynchronizujCzas();
+void sprawdzAutoReset();
+void resetSystem();
+
+void obslugaWaitingForCard();
+void obslugaWaitingForManualId();
+void obslugaWyboruSlotu();
+void obslugaTrybuSerwisowego();
+
+void zglosBladZdalnie(
+  const String& kod,
+  const String& opis
+);
+
+void polaczZWiFi();
+void sprawdzWiFi();
+
+void uruchomOTA();
+
+String opisKoduHttp(int kod);
+String zmapujBlad(String kodBledu);
+
+void wyslijZapytanie(
+  String idParam,
+  String kodSlotu,
+  bool isManual
+);
+
+void pokazBladPolaczenia(
+  String kod,
+  String opis
+);
+
+void wykonajOpcjeSerwisowa(int idx);
+
+void wejdzWTrybSerwisowy();
+void pokazMenuSerwisowe();
+void pokazDiagnostyke();
+
+void rozpocznijTrybRecznegoId();
+void pokazEkranRecznegoId();
+
+void pokazOpcjeNaLcd();
+
+void goodEffect(String imie, int punkty);
+void badEffect(String message);
+
+// ============================================================
+// LCD SAFE
+// ============================================================
+
+String lcdSafe(const String& s) {
+  String out;
+  out.reserve(16);
+
+  for (
+    unsigned int i = 0;
+    i < s.length() && out.length() < 16;
+  ) {
+    unsigned char c = (unsigned char)s[i];
+
+    if (c < 0x80) {
+      if (c >= 32 && c <= 126) {
+        out += (char)c;
+      }
+
+      i++;
+      continue;
+    }
+
+    if (
+      (c & 0xE0) == 0xC0 &&
+      i + 1 < s.length()
+    ) {
+      unsigned char c2 =
+        (unsigned char)s[i + 1];
+
+      char repl = '?';
+
+      if (c == 0xC3) {
+        if (c2 == 0x93 || c2 == 0xB3) repl = 'o';
+        else if (c2 == 0x81 || c2 == 0xA1) repl = 'a';
+        else repl = '?';
+      }
+
+      else if (c == 0xC4) {
+        if (c2 == 0x84 || c2 == 0x85) repl = 'a';
+        else if (c2 == 0x86 || c2 == 0x87) repl = 'c';
+        else if (c2 == 0x98 || c2 == 0x99) repl = 'e';
+        else if (c2 == 0x81 || c2 == 0x82) repl = 'l';
+        else if (c2 == 0xBB || c2 == 0xBC) repl = 'l';
+        else repl = '?';
+      }
+
+      else if (c == 0xC5) {
+        if (c2 == 0x83 || c2 == 0x84) repl = 'n';
+        else if (c2 == 0x9A || c2 == 0x9B) repl = 's';
+        else if (c2 == 0xB9 || c2 == 0xBA) repl = 'z';
+        else if (c2 == 0xBB || c2 == 0xBC) repl = 'z';
+        else if (c2 == 0x81 || c2 == 0x82) repl = 'l';
+        else repl = '?';
+      }
+
+      if (repl != '?') {
+        out += repl;
+      }
+
+      i += 2;
+      continue;
+    }
+
+    if (
+      (c & 0xF0) == 0xE0 &&
+      i + 2 < s.length()
+    ) {
+      i += 3;
+      continue;
+    }
+
+    if (
+      (c & 0xF8) == 0xF0 &&
+      i + 3 < s.length()
+    ) {
+      i += 4;
+      continue;
+    }
+
+    i++;
+  }
+
+  return out;
+}
+
+// ============================================================
+// URL ENCODE
+// ============================================================
+
+String urlEncode(const String& s) {
+  String out;
+
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+
+    if (
+      (c >= 'A' && c <= 'Z') ||
+      (c >= 'a' && c <= 'z') ||
+      (c >= '0' && c <= '9') ||
+      c == '-' ||
+      c == '_' ||
+      c == '.'
+    ) {
+      out += c;
+    }
+
+    else {
+      char buf[4];
+
+      sprintf(
+        buf,
+        "%%%02X",
+        (unsigned char)c
+      );
+
+      out += buf;
+    }
+  }
+
+  return out;
+}
+
+// ============================================================
+// OTA
+// ============================================================
+
+void uruchomOTA() {
+
+  // ----------------------------------------------------------
+  // STRONA OTA
+  // ----------------------------------------------------------
+
+  otaServer.on(
+    "/update",
+    HTTP_GET,
+    []() {
+
+      String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport"
+      content="width=device-width,initial-scale=1">
+<title>ESP32 OTA</title>
+
+<style>
+body {
+  font-family: Arial;
+  max-width: 500px;
+  margin: 40px auto;
+  padding: 20px;
+}
+
+h2 {
+  margin-bottom: 25px;
+}
+
+input[type=file] {
+  width: 100%;
+  margin-bottom: 20px;
+}
+
+input[type=submit] {
+  width: 100%;
+  padding: 14px;
+  font-size: 18px;
+}
+</style>
+
+</head>
+
+<body>
+
+<h2>ESP32 - aktualizacja</h2>
+
+<form
+  method="POST"
+  action="/update"
+  enctype="multipart/form-data"
+>
+
+<input
+  type="file"
+  name="update"
+  accept=".bin"
+  required
+>
+
+<input
+  type="submit"
+  value="AKTUALIZUJ ESP32"
+>
+
+</form>
+
+</body>
+</html>
+)rawliteral";
+
+      otaServer.send(
+        200,
+        "text/html",
+        html
+      );
+    }
+  );
+
+  // ----------------------------------------------------------
+  // WYSYLANIE FIRMWARE
+  // ----------------------------------------------------------
+
+  otaServer.on(
+    "/update",
+    HTTP_POST,
+
+    []() {
+
+      bool ok = !Update.hasError();
+
+      otaServer.sendHeader(
+        "Connection",
+        "close"
+      );
+
+      otaServer.send(
+        200,
+        "text/plain",
+        ok
+          ? "Aktualizacja OK. ESP32 uruchomi sie ponownie."
+          : "BLAD aktualizacji."
+      );
+
+      if (ok) {
+        delay(1000);
+        ESP.restart();
+      }
+    },
+
+    []() {
+
+      HTTPUpload& upload =
+        otaServer.upload();
+
+      // ------------------------------------------------------
+      // START
+      // ------------------------------------------------------
+
+      if (
+        upload.status ==
+        UPLOAD_FILE_START
+      ) {
+
+        Serial.printf(
+          "[OTA] Start: %s\n",
+          upload.filename.c_str()
+        );
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("OTA aktualizacja");
+        lcd.setCursor(0, 1);
+        lcd.print("Start...");
+
+        if (
+          !Update.begin(
+            UPDATE_SIZE_UNKNOWN
+          )
+        ) {
+
+          Update.printError(Serial);
+        }
+      }
+
+      // ------------------------------------------------------
+      // DANE
+      // ------------------------------------------------------
+
+      else if (
+        upload.status ==
+        UPLOAD_FILE_WRITE
+      ) {
+
+        if (
+          Update.write(
+            upload.buf,
+            upload.currentSize
+          )
+          != upload.currentSize
+        ) {
+
+          Update.printError(Serial);
+        }
+      }
+
+      // ------------------------------------------------------
+      // KONIEC
+      // ------------------------------------------------------
+
+      else if (
+        upload.status ==
+        UPLOAD_FILE_END
+      ) {
+
+        if (Update.end(true)) {
+
+          Serial.printf(
+            "[OTA] Koniec: %u bajtow\n",
+            upload.totalSize
+          );
+
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("OTA OK");
+          lcd.setCursor(0, 1);
+          lcd.print("Restart...");
+        }
+
+        else {
+
+          Update.printError(Serial);
+
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("OTA BLAD");
+        }
+      }
+    }
+  );
+
+  otaServer.begin();
+
+  Serial.println(
+    "[OTA] Serwer aktualizacji uruchomiony"
+  );
+
+  Serial.print(
+    "[OTA] Adres: http://"
+  );
+
+  Serial.print(
+    WiFi.localIP()
+  );
+
+  Serial.println(
+    "/update"
+  );
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  // ============================================================
+  // DIAGNOSTYKA BOOTU + CIRCUIT BREAKER
+  // ============================================================
+  {
+    esp_reset_reason_t powodR = esp_reset_reason();
+
+    bool zimnyStart =
+      (powodR == ESP_RST_POWERON) ||
+      (powodR == ESP_RST_BROWNOUT) ||
+      (powodR == ESP_RST_UNKNOWN);
+
+    if (zimnyStart) {
+      bootCount = 0;
+      lastAutoResetDayKey = 0;
+      autoResetEnabled = true;
+    }
+
+    bootCount++;
+
+    const char* powodStr = "Inny";
+
+    switch (powodR) {
+      case ESP_RST_POWERON:   powodStr = "PowerOn";   break;
+      case ESP_RST_SW:        powodStr = "SW reset";  break;
+      case ESP_RST_PANIC:     powodStr = "PANIC";     break;
+      case ESP_RST_INT_WDT:   powodStr = "Int WDT";   break;
+      case ESP_RST_TASK_WDT:  powodStr = "TaskWDT";   break;
+      case ESP_RST_WDT:       powodStr = "WDT";       break;
+      case ESP_RST_BROWNOUT:  powodStr = "Brownout";  break;
+      case ESP_RST_DEEPSLEEP: powodStr = "Deepsleep"; break;
+      default:                powodStr = "Inny";      break;
+    }
+
+    Serial.printf(
+      "[BOOT] #%d powod=%s wolny_heap=%u B\n",
+      bootCount,
+      powodStr,
+      (unsigned)ESP.getFreeHeap()
+    );
+
+    // Circuit breaker: przy petli >5 bootow wylaczamy auto-reset
+    // do nastepnego zimnego startu.
+    if (bootCount > 5) {
+      autoResetEnabled = false;
+      Serial.println(
+        "[SAFE] Wykryto petle resetow - auto-reset WYLACZONY"
+      );
+    }
+  }
+
+
+  esp_reset_reason_t powod =
+    esp_reset_reason();
+
+  Serial.printf(
+    "[BOOT] Powod resetu: %d, wolny heap: %u B\n",
+    (int)powod,
+    (unsigned)ESP.getFreeHeap()
+  );
+
+  pinMode(
+    greenLed,
+    OUTPUT
+  );
+
+  pinMode(
+    redLed,
+    OUTPUT
+  );
+
+  pinMode(
+    buzzer,
+    OUTPUT
+  );
+
+  digitalWrite(
+    greenLed,
+    LOW
+  );
+
+  digitalWrite(
+    redLed,
+    LOW
+  );
+
+  noTone(buzzer);
+
+  SPI.begin(
+    18,
+    35,
+    23,
+    21
+  );
+
+  rfid.PCD_Init();
+
+  Wire.begin(
+    19,
+    16
+  );
+
+  lcd.init();
+  lcd.backlight();
+
+  // Pokaz informacje o bocie na LCD (pomaga w diagnozie)
+  {
+    esp_reset_reason_t r = esp_reset_reason();
+    String rStr = "Inny";
+    switch (r) {
+      case ESP_RST_POWERON:   rStr = "PowerOn";   break;
+      case ESP_RST_SW:        rStr = "SW reset";  break;
+      case ESP_RST_PANIC:     rStr = "PANIC";     break;
+      case ESP_RST_INT_WDT:   rStr = "Int WDT";   break;
+      case ESP_RST_TASK_WDT:  rStr = "TaskWDT";   break;
+      case ESP_RST_WDT:       rStr = "WDT";       break;
+      case ESP_RST_BROWNOUT:  rStr = "Brownout";  break;
+      case ESP_RST_DEEPSLEEP: rStr = "Deepsleep"; break;
+      default:                rStr = "Inny";      break;
+    }
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Boot #" + String(bootCount));
+    lcd.setCursor(0, 1);
+    lcd.print(rStr);
+    if (!autoResetEnabled) {
+      lcd.setCursor(9, 0);
+      lcd.print("SAFE");
+    }
+    delay(2500);
+  }
+
+  // ----------------------------------------------------------
+  // WIFI
+  // ----------------------------------------------------------
+
+  polaczZWiFi();
+
+  // ----------------------------------------------------------
+  // OTA
+  // ----------------------------------------------------------
+
+  if (
+    WiFi.status() ==
+    WL_CONNECTED
+  ) {
+    uruchomOTA();
+  }
+
+  // ----------------------------------------------------------
+  // CZAS
+  // ----------------------------------------------------------
+
+  zsynchronizujCzas();
+
+  resetSystem();
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+
+  // ----------------------------------------------------------
+  // OTA
+  // ----------------------------------------------------------
+
+  otaServer.handleClient();
+
+  // ----------------------------------------------------------
+  // AUTO RESET
+  // ----------------------------------------------------------
+
+  sprawdzAutoReset();
+
+  // ----------------------------------------------------------
+  // GLOWNA LOGIKA
+  // ----------------------------------------------------------
+
+  if (
+    currentState ==
+    WAITING_FOR_CARD
+  ) {
+    obslugaWaitingForCard();
+  }
+
+  else if (
+    currentState ==
+    WAITING_FOR_MANUAL_ID
+  ) {
+    obslugaWaitingForManualId();
+  }
+
+  else if (
+    currentState ==
+    WAITING_FOR_CHOICE
+  ) {
+    obslugaWyboruSlotu();
+  }
+
+  else if (
+    currentState ==
+    SERVICE_MODE
+  ) {
+    obslugaTrybuSerwisowego();
+  }
+}
+
+// ============================================================
+// AUTO-RESET O 3:00
+// ============================================================
+
+void zsynchronizujCzas() {
+
+  configTzTime(
+    "CET-1CEST,M3.5.0,M10.5.0/3",
+    "pool.ntp.org",
+    "time.google.com",
+    "time.cloudflare.com"
+  );
+
+  Serial.print(
+    "[NTP] Synchronizacja czasu"
+  );
+
+  struct tm timeinfo;
+
+  int proby = 0;
+
+  while (
+    !getLocalTime(
+      &timeinfo,
+      1000
+    )
+    &&
+    proby < 10
+  ) {
+
+    Serial.print(".");
+    proby++;
+  }
+
+  if (proby >= 10) {
+
+    Serial.println(
+      " BLAD - brak czasu z NTP"
+    );
+
+    czasZsynchronizowany = false;
+
+    return;
+  }
+
+  czasZsynchronizowany = true;
+
+  Serial.printf(
+    "\n[NTP] Czas OK: %04d-%02d-%02d %02d:%02d:%02d\n",
+    timeinfo.tm_year + 1900,
+    timeinfo.tm_mon + 1,
+    timeinfo.tm_mday,
+    timeinfo.tm_hour,
+    timeinfo.tm_min,
+    timeinfo.tm_sec
+  );
+}
+
+void sprawdzAutoReset() {
+
+  if (!autoResetEnabled)
+    return;
+
+  if (!czasZsynchronizowany)
+    return;
+
+  if (
+    WiFi.status() !=
+    WL_CONNECTED
+  )
+    return;
+
+  // Opoznienie 60s po boocie - jesli urzadzenie wpada w petle,
+  // ten warunek NIGDY nie przejdzie i auto-reset sie nie nakreci.
+  if (millis() < 60000UL)
+    return;
+
+  struct tm timeinfo;
+
+  if (
+    !getLocalTime(
+      &timeinfo,
+      100
+    )
+  )
+    return;
+
+  int rok         = timeinfo.tm_year + 1900;
+  int miesiac     = timeinfo.tm_mon + 1;
+  int dzien       = timeinfo.tm_mday;
+  int godzina     = timeinfo.tm_hour;
+  int minuta      = timeinfo.tm_min;
+
+  // Klucz dnia YYYYMMDD
+  int dzienKlucz =
+    rok * 10000 +
+    miesiac * 100 +
+    dzien;
+
+  // Warunek zaleglego auto-resetu: po 3:00 i jeszcze nie zrobiony dzis.
+  // Warunek okna czasowego: dokladnie 3:00-3:04.
+  bool poTrzeciej =
+    (godzina >= 3) &&
+    (dzienKlucz != lastAutoResetDayKey);
+
+  bool oknoTrzecia =
+    (godzina == 3 && minuta < 5) &&
+    (dzienKlucz != lastAutoResetDayKey);
+
+  if (!poTrzeciej && !oknoTrzecia)
+    return;
+
+  lastAutoResetDayKey = dzienKlucz;
+
+  Serial.printf(
+    "[RESET] Auto-reset zaplanowany: %04d-%02d-%02d %02d:%02d (boot #%d)\n",
+    rok, miesiac, dzien, godzina, minuta, bootCount
+  );
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Auto-reset 3:00");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Restart...");
+
+  delay(2000);
+
+  ESP.restart();
+}
+
+
+
+// ============================================================
+// WIFI
+// ============================================================
+
+void polaczZWiFi() {
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print(
+    "Laczenie WiFi..."
+  );
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+  int proby = 0;
+
+  while (
+    WiFi.status() !=
+    WL_CONNECTED &&
+    proby < 40
+  ) {
+
+    delay(500);
+    proby++;
+  }
+
+  lcd.clear();
+
+  if (
+    WiFi.status() ==
+    WL_CONNECTED
+  ) {
+
+    lcd.print(
+      "WiFi OK"
+    );
+
+    lcd.setCursor(0, 1);
+
+    lcd.print(
+      WiFi.localIP().toString()
+    );
+
+    Serial.print(
+      "[WiFi] IP: "
+    );
+
+    Serial.println(
+      WiFi.localIP()
+    );
+
+    delay(1200);
+  }
+
+  else {
+
+    lcd.print(
+      "Brak WiFi!"
+    );
+
+    lcd.setCursor(0, 1);
+
+    lcd.print(
+      "Sprawdz WiFi"
+    );
+
+    zglosBladZdalnie(
+      "wifi_brak",
+      "Nie polaczono z WiFi"
+    );
+
+    delay(1600);
+  }
+}
+
+void sprawdzWiFi() {
+
+  if (
+    WiFi.status() !=
+    WL_CONNECTED
+  ) {
+
+    WiFi.reconnect();
+
+    delay(300);
+  }
+}
+
+// ============================================================
+// BLEDY + HTTP
+// ============================================================
+
+void ustawOstatniBlad(
+  const String& kod,
+  const String& opis
+) {
+
+  ostatniKodBledu = kod;
+  ostatniOpisBledu = opis;
+  ostatniBladCzas = millis();
+
+  Serial.print("[BLAD] ");
+  Serial.print(kod);
+  Serial.print(": ");
+  Serial.println(opis);
+}
+
+void zglosBladZdalnie(
+  const String& kod,
+  const String& opis
+) {
+
+  ustawOstatniBlad(
+    kod,
+    opis
+  );
+
+  if (
+    WiFi.status() !=
+    WL_CONNECTED
+  )
+    return;
+
+  String url =
+    String(WEBAPP_URL) +
+    "?action=err";
+
+  url +=
+    "&device=" +
+    urlEncode(
+      String(DEVICE_ID)
+    );
+
+  url +=
+    "&kod=" +
+    urlEncode(kod);
+
+  url +=
+    "&msg=" +
+    urlEncode(opis);
+
+  WiFiClientSecure client;
+
+  client.setInsecure();
+
+  HTTPClient http;
+
+  http.setTimeout(6000);
+  http.setConnectTimeout(4000);
+
+  if (
+    http.begin(
+      client,
+      url
+    )
+  ) {
+
+    http.GET();
+    http.end();
+  }
+}
+
+int wykonajGET(
+  const String& url,
+  String& outBody,
+  String& outOpis
+) {
+
+  sprawdzWiFi();
+
+  if (
+    WiFi.status() !=
+    WL_CONNECTED
+  ) {
+
+    outOpis =
+      "Brak WiFi";
+
+    return -100;
+  }
+
+  for (
+    int proba = 1;
+    proba <= 2;
+    proba++
+  ) {
+
+    WiFiClientSecure client;
+
+    client.setInsecure();
+
+    HTTPClient http;
+
+    http.setTimeout(20000);
+    http.setConnectTimeout(10000);
+
+    if (
+      !http.begin(
+        client,
+        url
+      )
+    ) {
+
+      outOpis =
+        "Zly URL";
+
+      return -101;
+    }
+
+    http.setFollowRedirects(
+      HTTPC_FORCE_FOLLOW_REDIRECTS
+    );
+
+    int kod =
+      http.GET();
+
+    if (kod > 0) {
+
+      outBody =
+        http.getString();
+
+      http.end();
+
+      return kod;
+    }
+
+    outOpis =
+      http.errorToString(kod) +
+      " (heap:" +
+      String(
+        ESP.getFreeHeap() / 1024
+      ) +
+      "KB)";
+
+    http.end();
+
+    Serial.print(
+      "[HTTP proba "
+    );
+
+    Serial.print(proba);
+
+    Serial.print(
+      "] kod="
+    );
+
+    Serial.print(kod);
+
+    Serial.print(
+      " opis="
+    );
+
+    Serial.println(outOpis);
+
+    if (proba == 1) {
+
+      WiFi.reconnect();
+
+      delay(600);
+    }
+
+    else {
+
+      return kod;
+    }
+  }
+
+  return -1;
+}
+
+// ============================================================
+// WAITING_FOR_CARD
+// ============================================================
+
+void obslugaWaitingForCard() {
+
+  char key =
+    keypad.getKey();
+
+  if (key == '#') {
+
+    tone(
+      buzzer,
+      1800,
+      40
+    );
+
+    rozpocznijTrybRecznegoId();
+
+    return;
+  }
+
+  if (
+    rfid.PICC_IsNewCardPresent() &&
+    rfid.PICC_ReadCardSerial()
+  ) {
+
+    String uid = "";
+
+    char bufBajt[3];
+
+    for (
+      byte i = 0;
+      i < rfid.uid.size;
+      i++
+    ) {
+
+      sprintf(
+        bufBajt,
+        "%02X",
+        rfid.uid.uidByte[i]
+      );
+
+      uid += bufBajt;
+    }
+
+    rfid.PICC_HaltA();
+
+    if (
+      uid.equalsIgnoreCase(
+        ADMIN_UID
+      )
+    ) {
+
+      tone(
+        buzzer,
+        1500,
+        60
+      );
+
+      delay(80);
+
+      tone(
+        buzzer,
+        2000,
+        100
+      );
+
+      wejdzWTrybSerwisowy();
+
+      return;
+    }
+
+    tone(
+      buzzer,
+      1200,
+      120
+    );
+
+    pendingUidOrId =
+      uid;
+
+    pendingIsManual =
+      false;
+
+    wyslijZapytanie(
+      uid,
+      "",
+      false
+    );
+  }
+}
+
+// ============================================================
+// TRYB SERWISOWY
+// ============================================================
+
+void pokazDiagnostyke() {
+
+  unsigned long start =
+    millis();
+
+  int ekran = 0;
+
+  while (
+    millis() - start < 9000
+  ) {
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+
+    if (ekran == 0) {
+
+      lcd.print("IP: ");
+
+      lcd.print(
+        WiFi.status() ==
+        WL_CONNECTED
+          ? WiFi.localIP().toString()
+          : String("brak WiFi")
+      );
+
+      lcd.setCursor(0, 1);
+
+      lcd.print("RSSI: ");
+
+      lcd.print(
+        WiFi.status() ==
+        WL_CONNECTED
+          ? String(WiFi.RSSI()) +
+            " dBm"
+          : "-"
+      );
+    }
+
+    else if (ekran == 1) {
+
+      lcd.print(
+        "Wolny heap:"
+      );
+
+      lcd.setCursor(0, 1);
+
+      lcd.print(
+        String(
+          ESP.getFreeHeap() / 1024
+        ) +
+        " KB"
+      );
+    }
+
+    else {
+
+      lcd.print(
+        "Ost.blad: "
+      );
+
+      lcd.print(
+        ostatniKodBledu.substring(
+          0,
+          6
+        )
+      );
+
+      lcd.setCursor(0, 1);
+
+      lcd.print(
+        lcdSafe(
+          ostatniOpisBledu
+        )
+      );
+    }
+
+    unsigned long t0 =
+      millis();
+
+    while (
+      millis() - t0 < 2500
+    ) {
+
+      if (keypad.getKey()) {
+
+        resetSystem();
+
+        return;
+      }
+
+      delay(20);
+    }
+
+    ekran =
+      (ekran + 1) % 3;
+  }
+
+  resetSystem();
+}
+
+void wejdzWTrybSerwisowy() {
+
+  serwisIndex = 0;
+
+  czasWejsciaWSerwis =
+    millis();
+
+  currentState =
+    SERVICE_MODE;
+
+  pokazMenuSerwisowe();
+}
+
+void pokazMenuSerwisowe() {
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print(
+    "SERWIS "
+  );
+
+  lcd.print(
+    String(
+      serwisIndex + 1
+    ) +
+    "/" +
+    String(
+      SERWIS_LICZBA_OPCJI
+    )
+  );
+
+  lcd.setCursor(0, 1);
+
+  lcd.print(
+    String(
+      SERWIS_NAZWY[
+        serwisIndex
+      ]
+    ).substring(
+      0,
+      16
+    )
+  );
+}
+
+void obslugaTrybuSerwisowego() {
+
+  if (
+    millis() -
+    czasWejsciaWSerwis >
+    TIMEOUT_SERWIS
+  ) {
+
+    tone(
+      buzzer,
+      300,
+      200
+    );
+
+    resetSystem();
+
+    return;
+  }
+
+  char key =
+    keypad.getKey();
+
+  if (!key)
+    return;
+
+  czasWejsciaWSerwis =
+    millis();
+
+  if (key == '*') {
+
+    tone(
+      buzzer,
+      1200,
+      40
+    );
+
+    serwisIndex =
+      (serwisIndex + 1) %
+      SERWIS_LICZBA_OPCJI;
+
+    pokazMenuSerwisowe();
+
+    return;
+  }
+
+  if (key == '#') {
+
+    tone(
+      buzzer,
+      1800,
+      50
+    );
+
+    wykonajOpcjeSerwisowa(
+      serwisIndex
+    );
+
+    return;
+  }
+}
+
+void wykonajOpcjeSerwisowa(
+  int idx
+) {
+
+  if (idx == 0) {
+
+    pokazDiagnostyke();
+
+    return;
+  }
+
+  if (idx == 1) {
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+
+    lcd.print(
+      "Testuje..."
+    );
+
+    String body;
+    String opis;
+
+    int kod =
+      wykonajGET(
+        String(WEBAPP_URL) +
+        "?action=config",
+        body,
+        opis
+      );
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+
+    if (kod == 200) {
+
+      lcd.print(
+        "Polaczenie OK"
+      );
+
+      lcd.setCursor(0, 1);
+
+      lcd.print(
+        "HTTP 200"
+      );
+    }
+
+    else {
+
+      lcd.print(
+        (
+          "Blad: " +
+          String(kod)
+        ).substring(
+          0,
+          16
+        )
+      );
+
+      lcd.setCursor(0, 1);
+
+      lcd.print(
+        lcdSafe(opis)
+      );
+    }
+
+    delay(2500);
+
+    czasWejsciaWSerwis =
+      millis();
+
+    pokazMenuSerwisowe();
+
+    return;
+  }
+
+  if (idx == 2) {
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+
+    lcd.print(
+      "Restart WiFi..."
+    );
+
+    WiFi.disconnect(true);
+
+    delay(500);
+
+    polaczZWiFi();
+
+    // OTA server jest juz uruchomiony globalnie.
+    // Powtorne uruchomOTA() rejestrowaloby te same
+    // handlery drugi raz na tym samym WebServer.
+
+    czasWejsciaWSerwis =
+      millis();
+
+    pokazMenuSerwisowe();
+
+    return;
+  }
+
+  if (idx == 3) {
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+
+    lcd.print(
+      "Restart..."
+    );
+
+    delay(600);
+
+    ESP.restart();
+
+    return;
+  }
+
+  resetSystem();
+}
+
+// ============================================================
+// TRYB RECZNEGO ID
+// ============================================================
+
+void rozpocznijTrybRecznegoId() {
+
+  manualIdBuffer = "";
+
+  czasWejsciaWTrybRecznyId =
+    millis();
+
+  currentState =
+    WAITING_FOR_MANUAL_ID;
+
+  pokazEkranRecznegoId();
+}
+
+void obslugaWaitingForManualId() {
+
+  if (
+    millis() -
+    czasWejsciaWTrybRecznyId >
+    TIMEOUT_WPROWADZANIA
+  ) {
+
+    tone(
+      buzzer,
+      300,
+      200
+    );
+
+    resetSystem();
+
+    return;
+  }
+
+  char key =
+    keypad.getKey();
+
+  if (!key)
+    return;
+
+  czasWejsciaWTrybRecznyId =
+    millis();
+
+  if (key == '*') {
+
+    if (
+      manualIdBuffer.length() >
+      0
+    ) {
+
+      tone(
+        buzzer,
+        900,
+        40
+      );
+
+      manualIdBuffer.remove(
+        manualIdBuffer.length() - 1
+      );
+
+      pokazEkranRecznegoId();
+    }
+
+    else {
+
+      tone(
+        buzzer,
+        300,
+        200
+      );
+
+      resetSystem();
+    }
+
+    return;
+  }
+
+  if (key == '#') {
+
+    if (
+      manualIdBuffer.length() ==
+      0
+    ) {
+
+      tone(
+        buzzer,
+        300,
+        150
+      );
+
+      return;
+    }
+
+    tone(
+      buzzer,
+      1800,
+      40
+    );
+
+    pendingUidOrId =
+      manualIdBuffer;
+
+    pendingIsManual =
+      true;
+
+    wyslijZapytanie(
+      manualIdBuffer,
+      "",
+      true
+    );
+
+    return;
+  }
+
+  if (
+    key >= '0' &&
+    key <= '9'
+  ) {
+
+    if (
+      manualIdBuffer.length() <
+      MAX_DLUGOSC_ID
+    ) {
+
+      tone(
+        buzzer,
+        1800,
+        40
+      );
+
+      manualIdBuffer +=
+        key;
+
+      pokazEkranRecznegoId();
+    }
+
+    else {
+
+      tone(
+        buzzer,
+        300,
+        100
+      );
+    }
+  }
+}
+
+void pokazEkranRecznegoId() {
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print(
+    "Wpisz ID:"
+  );
+
+  lcd.setCursor(0, 1);
+
+  if (
+    manualIdBuffer.length() ==
+    0
+  ) {
+
+    lcd.print(
+      "*-Anuluj #-OK"
+    );
+  }
+
+  else {
+
+    lcd.print(
+      manualIdBuffer
+    );
+  }
+}
+
+// ============================================================
+// WYSYLANIE ZAPYTANIA
+// ============================================================
+
+void wyslijZapytanie(
+  String idParam,
+  String kodSlotu,
+  bool isManual
+) {
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print(
+    "Wysylanie..."
+  );
+
+  sprawdzWiFi();
+
+  if (
+    WiFi.status() !=
+    WL_CONNECTED
+  ) {
+
+    pokazBladPolaczenia(
+      "Brak WiFi",
+      "Sprawdz sygnal/haslo"
+    );
+
+    return;
+  }
+
+  String url =
+    String(WEBAPP_URL) +
+    "?device=" +
+    urlEncode(
+      String(DEVICE_ID)
+    );
+
+  url +=
+    "&id=" +
+    urlEncode(idParam);
+
+  if (
+    kodSlotu.length() > 0
+  ) {
+
+    url +=
+      "&type=" +
+      urlEncode(kodSlotu);
+  }
+
+  url +=
+    "&manual=" +
+    String(
+      isManual
+        ? "1"
+        : "0"
+    );
+
+  String odpowiedz;
+  String opisSieciowy;
+
+  int kodHttp =
+    wykonajGET(
+      url,
+      odpowiedz,
+      opisSieciowy
+    );
+
+  if (
+    kodHttp <= 0
+  ) {
+
+    pokazBladPolaczenia(
+      "Sieciowy " +
+        String(kodHttp),
+      opisSieciowy
+    );
+
+    return;
+  }
+
+  if (
+    kodHttp != 200
+  ) {
+
+    pokazBladPolaczenia(
+      "HTTP " +
+        String(kodHttp),
+      opisKoduHttp(kodHttp)
+    );
+
+    return;
+  }
+
+  Serial.println(
+    odpowiedz
+  );
+
+  if (
+    odpowiedz.length() == 0
+  ) {
+
+    pokazBladPolaczenia(
+      "Puste HTTP200",
+      "Serwer OK, brak tresci"
+    );
+
+    return;
+  }
+
+  DynamicJsonDocument doc(
+    2048
+  );
+
+  DeserializationError errJson =
+    deserializeJson(
+      doc,
+      odpowiedz
+    );
+
+  if (errJson) {
+
+    pokazBladPolaczenia(
+      "Zly JSON",
+      String(
+        errJson.c_str()
+      )
+    );
+
+    Serial.print(
+      "Tresc odpowiedzi: "
+    );
+
+    Serial.println(
+      odpowiedz.substring(
+        0,
+        200
+      )
+    );
+
+    return;
+  }
+
+  bool sukces =
+    doc["sukces"] | false;
+
+  bool skan =
+    doc["skan"] | false;
+
+  const char* bladC =
+    doc["blad"];
+
+  String blad =
+    bladC
+      ? String(bladC)
+      : "";
+
+  if (
+    sukces &&
+    skan
+  ) {
+
+    const char* uidC =
+      doc["uid"];
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+
+    lcd.print(
+      "UID zapisany"
+    );
+
+    lcd.setCursor(0, 1);
+
+    lcd.print(
+      lcdSafe(
+        uidC
+          ? String(uidC)
+          : ""
+      )
+    );
+
+    digitalWrite(
+      greenLed,
+      HIGH
+    );
+
+    tone(
+      buzzer,
+      1000,
+      80
+    );
+
+    delay(100);
+
+    tone(
+      buzzer,
+      1600,
+      120
+    );
+
+    delay(1400);
+
+    digitalWrite(
+      greenLed,
+      LOW
+    );
+
+    resetSystem();
+
+    return;
+  }
+
+  if (
+    !sukces &&
+    blad ==
+      "wybor_wymagany"
+  ) {
+
+    opcjeLiczba = 0;
+
+    JsonArray arr =
+      doc["opcje"].as<JsonArray>();
+
+    for (
+      JsonObject o : arr
+    ) {
+
+      if (
+        opcjeLiczba >= 6
+      )
+        break;
+
+      const char* k =
+        o["kod"];
+
+      const char* nLcd =
+        o["nazwaLcd"];
+
+      const char* n =
+        o["nazwa"];
+
+      String label =
+        nLcd
+          ? String(nLcd)
+          : (
+              n
+                ? String(n)
+                : "Opcja"
+            );
+
+      opcjeBuf[
+        opcjeLiczba
+      ].kod =
+        k
+          ? String(k)
+          : "";
+
+      opcjeBuf[
+        opcjeLiczba
+      ].nazwa =
+        lcdSafe(label);
+
+      opcjeBuf[
+        opcjeLiczba
+      ].punkty =
+        o["punkty"] | 0;
+
+      opcjeLiczba++;
+    }
+
+    if (
+      opcjeLiczba == 0
+    ) {
+
+      badEffect(
+        "Brak opcji"
+      );
+
+      delay(1400);
+
+      resetSystem();
+
+      return;
+    }
+
+    opcjeIndex = 0;
+
+    czasWejsciaWWybor =
+      millis();
+
+    currentState =
+      WAITING_FOR_CHOICE;
+
+    tone(
+      buzzer,
+      1400,
+      60
+    );
+
+    pokazOpcjeNaLcd();
+
+    return;
+  }
+
+  if (sukces) {
+
+    const char* imieC =
+      doc["imie"];
+
+    int punkty =
+      doc["punkty"] | 0;
+
+    String line1 =
+      lcdSafe(
+        imieC
+          ? String(imieC)
+          : "OK"
+      );
+
+    goodEffect(
+      line1,
+      punkty
+    );
+  }
+
+  else {
+
+    const char* wiadC =
+      doc["wiadomosc"];
+
+    String wiad =
+      wiadC
+        ? String(wiadC)
+        : "";
+
+    ustawOstatniBlad(
+      blad.length()
+        ? blad
+        : "nieznany",
+
+      wiad.length()
+        ? wiad
+        : zmapujBlad(blad)
+    );
+
+    badEffect(
+      zmapujBlad(blad)
+    );
+
+    if (
+      wiad.length()
+    ) {
+
+      Serial.print(
+        "[SERWER] "
+      );
+
+      Serial.println(
+        wiad
+      );
+    }
+  }
+
+  delay(2000);
+
+  resetSystem();
+}
+
+String opisKoduHttp(
+  int kod
+) {
+
+  if (kod == 404)
+    return "Zly/usuniety URL";
+
+  if (
+    kod == 302 ||
+    kod == 401 ||
+    kod == 403
+  )
+    return "Zly dostep wdrozenia";
+
+  if (kod == 500)
+    return "Blad w Kod.gs";
+
+  if (kod == 429)
+    return "Limit zapytan";
+
+  return "Sprawdz wdrozenie";
+}
+
+// ============================================================
+// WYBOR SLOTU
+// ============================================================
+
+void pokazOpcjeNaLcd() {
+
+  lcd.clear();
+
+  String l1 =
+    String(
+      opcjeIndex + 1
+    ) +
+    "/" +
+    String(
+      opcjeLiczba
+    ) +
+    " ";
+
+  String rest =
+    opcjeBuf[
+      opcjeIndex
+    ].nazwa;
+
+  if (
+    rest.indexOf('+') < 0 &&
+    opcjeBuf[
+      opcjeIndex
+    ].punkty != 0
+  ) {
+
+    String withP =
+      rest +
+      " +" +
+      String(
+        opcjeBuf[
+          opcjeIndex
+        ].punkty
+      );
+
+    if (
+      withP.length() <= 13
+    )
+      rest = withP;
+  }
+
+  l1 += rest;
+
+  lcd.setCursor(0, 0);
+
+  lcd.print(
+    l1.substring(
+      0,
+      16
+    )
+  );
+
+  lcd.setCursor(0, 1);
+
+  lcd.print(
+    "*=dalej  #=OK"
+  );
+}
+
+void obslugaWyboruSlotu() {
+
+  if (
+    millis() -
+    czasWejsciaWWybor >
+    45000UL
+  ) {
+
+    tone(
+      buzzer,
+      300,
+      200
+    );
+
+    resetSystem();
+
+    return;
+  }
+
+  char key =
+    keypad.getKey();
+
+  if (!key)
+    return;
+
+  czasWejsciaWWybor =
+    millis();
+
+  if (key == '*') {
+
+    tone(
+      buzzer,
+      1200,
+      40
+    );
+
+    opcjeIndex =
+      (
+        opcjeIndex + 1
+      ) %
+      opcjeLiczba;
+
+    pokazOpcjeNaLcd();
+
+    return;
+  }
+
+  if (key == '#') {
+
+    tone(
+      buzzer,
+      1800,
+      50
+    );
+
+    String kod =
+      opcjeBuf[
+        opcjeIndex
+      ].kod;
+
+    if (
+      kod.length() == 0
+    ) {
+
+      badEffect(
+        "Zly kod"
+      );
+
+      delay(1200);
+
+      resetSystem();
+
+      return;
+    }
+
+    wyslijZapytanie(
+      pendingUidOrId,
+      kod,
+      pendingIsManual
+    );
+
+    return;
+  }
+
+  if (
+    key >= '1' &&
+    key <= '6'
+  ) {
+
+    int idx =
+      key - '1';
+
+    if (
+      idx < opcjeLiczba
+    ) {
+
+      tone(
+        buzzer,
+        1800,
+        50
+      );
+
+      opcjeIndex =
+        idx;
+
+      wyslijZapytanie(
+        pendingUidOrId,
+        opcjeBuf[
+          opcjeIndex
+        ].kod,
+        pendingIsManual
+      );
+    }
+  }
+}
+
+// ============================================================
+// EFEKTY + BLEDY
+// ============================================================
+
+void pokazBladPolaczenia(
+  String kod,
+  String opis
+) {
+
+  zglosBladZdalnie(
+    kod,
+    opis
+  );
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print(
+    lcdSafe(kod)
+      .substring(
+        0,
+        16
+      )
+  );
+
+  lcd.setCursor(0, 1);
+
+  lcd.print(
+    lcdSafe(opis)
+      .substring(
+        0,
+        16
+      )
+  );
+
+  digitalWrite(
+    redLed,
+    HIGH
+  );
+
+  tone(
+    buzzer,
+    150,
+    550
+  );
+
+  delay(1800);
+
+  digitalWrite(
+    redLed,
+    LOW
+  );
+
+  resetSystem();
+}
+
+String zmapujBlad(
+  String kodBledu
+) {
+
+  if (
+    kodBledu ==
+    "nieznana_karta"
+  )
+    return "Nieznana karta!";
+
+  if (
+    kodBledu ==
+    "karta_nieaktywna"
+  )
+    return "Karta nieakt.";
+
+  if (
+    kodBledu ==
+    "nieznane_id"
+  )
+    return "Nieznane ID!";
+
+  if (
+    kodBledu ==
+      "brak_id" ||
+    kodBledu ==
+      "brak_uid"
+  )
+    return "Brak ID!";
+
+  if (
+    kodBledu ==
+    "brak_wydarzenia"
+  )
+    return "Brak mszy teraz";
+
+  if (
+    kodBledu ==
+    "juz_zaliczone"
+  )
+    return "Juz zaliczone";
+
+  if (
+    kodBledu ==
+    "nieznane_wydarzenie"
+  )
+    return "Zly wybor";
+
+  if (
+    kodBledu.length() > 0
+  ) {
+
+    return (
+      "Blad: " +
+      kodBledu
+    ).substring(
+      0,
+      16
+    );
+  }
+
+  return "Blad serwera";
+}
+
+void goodEffect(
+  String imie,
+  int punkty
+) {
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print(
+    lcdSafe(imie)
+      .substring(
+        0,
+        16
+      )
+  );
+
+  lcd.setCursor(0, 1);
+
+  lcd.print(
+    "+" +
+    String(punkty) +
+    " pkt"
+  );
+
+  digitalWrite(
+    greenLed,
+    HIGH
+  );
+
+  tone(
+    buzzer,
+    1000,
+    100
+  );
+
+  delay(120);
+
+  tone(
+    buzzer,
+    1400,
+    100
+  );
+
+  delay(120);
+
+  tone(
+    buzzer,
+    1900,
+    220
+  );
+
+  delay(900);
+
+  digitalWrite(
+    greenLed,
+    LOW
+  );
+}
+
+void badEffect(
+  String message
+) {
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print(
+    lcdSafe(message)
+      .substring(
+        0,
+        16
+      )
+  );
+
+  lcd.setCursor(0, 1);
+
+  lcd.print(
+    lcdSafe(
+      ostatniKodBledu
+    ).substring(
+      0,
+      16
+    )
+  );
+
+  digitalWrite(
+    redLed,
+    HIGH
+  );
+
+  tone(
+    buzzer,
+    150,
+    550
+  );
+
+  delay(800);
+
+  digitalWrite(
+    redLed,
+    LOW
+  );
+}
+
+// ============================================================
+// RESET STANU
+// ============================================================
+
+void resetSystem() {
+
+  currentState =
+    WAITING_FOR_CARD;
+
+  manualIdBuffer = "";
+
+  pendingUidOrId = "";
+
+  opcjeLiczba = 0;
+
+  opcjeIndex = 0;
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print(
+    "Zbliz karte"
+  );
+
+  lcd.setCursor(0, 1);
+
+  lcd.print(
+    "#=ID"
+  );
+}
