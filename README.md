@@ -72,12 +72,6 @@ Pełna specyfikacja endpointów, formatu zapytań i odpowiedzi znajduje się w [
 
 ---
 
-## Konfiguracja
-
-Wrażliwe dane ustaw w **Script Properties** w GAS (`Projekt → Ustawienia projektu → Właściwości skryptu`), nigdy nie wpisuj ich bezpośrednio w kodzie ani nie commituj do repozytorium. Przykładowa lista wymaganych kluczy znajduje się w [`.env.example`](.env.example).
-
----
-
 ## Wdrożenie własnej instancji
 
 1. Sforkuj repozytorium i utwórz własny arkusz Google Sheets (nie używaj arkusza innej instancji).
